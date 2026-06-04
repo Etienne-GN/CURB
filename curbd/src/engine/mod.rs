@@ -69,6 +69,10 @@ struct EngineInner {
     /// eBPF egress classifier; `None` falls back to nftables policing for
     /// upload (E1). When present, per-app upload is HTB-shaped, not policed.
     shaper: Option<EbpfShaper>,
+    /// When true (opt-in via `CURB_EBPF_INGRESS`), per-app download is also
+    /// HTB-shaped (clsact ingress set-priority + mirred redirect to IFB);
+    /// otherwise download uses nftables policing.
+    ebpf_ingress: bool,
     /// Next HTB class minor to hand out.
     next_minor: Mutex<u16>,
 }
@@ -99,9 +103,19 @@ impl Engine {
 
         // Try to load the eBPF egress classifier for smooth per-app upload
         // shaping; fall back to nftables policing if unavailable.
-        let shaper = match EbpfShaper::attach(&iface) {
+        // Off-by-default: only enable eBPF download shaping (clsact ingress +
+        // set-priority + mirred redirect to IFB) when explicitly opted in.
+        let ebpf_ingress = std::env::var("CURB_EBPF_INGRESS")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
+        let shaper = match EbpfShaper::attach(&iface, ebpf_ingress) {
             Ok(s) => {
-                info!("per-app upload: eBPF HTB shaping; download: nftables policing");
+                if ebpf_ingress {
+                    info!("per-app shaping: eBPF HTB both directions (CURB_EBPF_INGRESS enabled)");
+                } else {
+                    info!("per-app upload: eBPF HTB shaping; download: nftables policing");
+                }
                 Some(s)
             }
             Err(e) => {
@@ -118,6 +132,7 @@ impl Engine {
             }),
             apps: Mutex::new(HashMap::new()),
             shaper,
+            ebpf_ingress,
             next_minor: Mutex::new(FIRST_MINOR),
             iface,
         });
@@ -336,6 +351,7 @@ impl Engine {
     /// Remove all CURB kernel state. Call on daemon shutdown.
     pub fn shutdown(&self) {
         tc::clear_egress(&self.inner.iface);
+        tc::del_ingress_redirect(&self.inner.iface);
         tc::clear_ingress(&self.inner.iface, IFB_DEV);
         tc::ifb_clear(IFB_DEV);
         tc::clear_clsact(&self.inner.iface);
@@ -402,19 +418,57 @@ impl EngineInner {
         Ok(())
     }
 
-    /// Rebuild ingress (download) host shaping via the IFB device (P2 `mirred`
-    /// path — proven safe). Per-app download limits are handled by nftables
-    /// policing (see [`reconcile_nft`]); smooth eBPF download shaping is only
-    /// exercised in a network namespace, never on the live interface.
+    /// Rebuild ingress (download) shaping.
+    ///
+    /// Default (safe) path: host download via the P2 `mirred`+IFB on the legacy
+    /// `ingress` qdisc; per-app download via nftables policing.
+    ///
+    /// Opt-in eBPF path (`CURB_EBPF_INGRESS`): build an IFB HTB tree (host
+    /// default + per-app download classes) and add a `mirred` redirect filter on
+    /// the clsact ingress hook (the eBPF set-priority filter, already attached at
+    /// a lower priority, classifies first). This is the netns-validated,
+    /// reinjection-correct mechanism — never `bpf_redirect`.
     fn reconcile_ingress(&self) -> Result<()> {
         let st = self.state.lock().unwrap().clone();
-        tc::clear_ingress(&self.iface, IFB_DEV);
-        if st.enabled {
-            if let Some(down) = st.host.down_bps {
-                tc::apply_ingress(&self.iface, IFB_DEV, down)
-                    .context("applying host download cap")?;
+
+        if !(self.shaper.is_some() && self.ebpf_ingress) {
+            // Safe default path.
+            tc::clear_ingress(&self.iface, IFB_DEV);
+            if st.enabled {
+                if let Some(down) = st.host.down_bps {
+                    tc::apply_ingress(&self.iface, IFB_DEV, down)
+                        .context("applying host download cap")?;
+                }
             }
+            return Ok(());
         }
+
+        // eBPF download-shaping path.
+        let down_apps: Vec<(u16, u64)> = {
+            let apps = self.apps.lock().unwrap();
+            apps.values()
+                .filter_map(|r| r.down_bps.map(|d| (r.minor, d)))
+                .collect()
+        };
+        let need = st.enabled && (st.host.down_bps.is_some() || !down_apps.is_empty());
+
+        // Always rebuild: drop the redirect filter and IFB first.
+        tc::del_ingress_redirect(&self.iface);
+        tc::ifb_clear(IFB_DEV);
+        if !need {
+            return Ok(());
+        }
+        tc::ifb_root(IFB_DEV, st.host.down_bps).context("building IFB HTB root")?;
+        let down_ceil = st.host.down_bps.unwrap_or(tc::LINE_RATE_BPS);
+        for (minor, down) in down_apps {
+            tc::ifb_app_class(IFB_DEV, minor, down, down_ceil.max(down))
+                .context("adding per-app ingress class")?;
+        }
+        // Enable the reinjection-correct redirect (the set-priority eBPF filter
+        // already ran at a lower priority).
+        tc::add_ingress_redirect(&self.iface, IFB_DEV)
+            .context("adding mirred ingress redirect")?;
+        info!(host_down = ?st.host.down_bps, "eBPF ingress shaping (mirred + IFB HTB) applied");
         Ok(())
     }
 
@@ -426,12 +480,14 @@ impl EngineInner {
     fn reconcile_nft(&self) -> Result<()> {
         let enabled = self.state.lock().unwrap().enabled;
         let ebpf_egress = self.shaper.is_some();
+        let ebpf_ingress = ebpf_egress && self.ebpf_ingress;
         let rules: Vec<nft::AppRule> = {
             let apps = self.apps.lock().unwrap();
             apps.values()
                 .map(|r| nft::AppRule {
                     cgroup_rel: cgroup::app_rel(&r.dir),
-                    down_bps: r.down_bps,
+                    // Omit a direction here when eBPF HTB shapes it.
+                    down_bps: if ebpf_ingress { None } else { r.down_bps },
                     up_bps: if ebpf_egress { None } else { r.up_bps },
                     scope: r.scope,
                     blocked: r.blocked,

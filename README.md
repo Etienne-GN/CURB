@@ -68,8 +68,26 @@ librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev`.
 - **P5 — Quotas** ✅ per-app accounting + block-on-exceed + persistence.
 - **P6 — GUI** ✅ live dark-themed Tauri app wired to the daemon.
 
+### eBPF shaping
+
+Per-app **upload** is shaped smoothly via an eBPF egress classifier + HTB
+(queuing, not dropping). Per-app **download** defaults to nftables policing.
+
+Smooth eBPF **download** shaping (clsact ingress set-priority + `mirred` redirect
+to an IFB device + HTB) is implemented but **off by default** — enable it with:
+
+```sh
+CURB_EBPF_INGRESS=1 curbd
+```
+
+> ⚠️ The download path redirects all ingress through an IFB device. It is
+> validated end-to-end in an isolated network namespace
+> (`scripts/netns_daemon_test.sh`) — run that to verify on your kernel before
+> enabling on a real interface. An earlier `bpf_redirect`-based attempt
+> blackholed inbound traffic; the shipped path uses the reinjection-correct
+> `mirred` redirect instead.
+
 ### Future
-- eBPF (Aya) tc classifier for smooth per-app *shaping* (vs current policing).
 - proc-connector exec hook to place processes in their cgroup before they
   connect (catch already-established connections).
 - Host-wide LAN/Internet scoping; per-app live graphs history; system tray.

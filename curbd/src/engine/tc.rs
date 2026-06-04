@@ -116,12 +116,34 @@ pub fn clear_clsact(iface: &str) {
     run_ignore(&tc_bin(), &["qdisc", "del", "dev", iface, "clsact"]);
 }
 
+/// Priority of the `mirred` ingress-redirect filter (runs after the eBPF
+/// set-priority filter at priority 1).
+const INGRESS_REDIRECT_PRIO: &str = "2";
+
+/// Add the `mirred` ingress redirect to the IFB device on the clsact ingress
+/// hook. This is the reinjection-correct redirect (as the P2 host path uses);
+/// the eBPF set-priority filter at a lower priority has already classified the
+/// packet by then.
+pub fn add_ingress_redirect(iface: &str, ifb: &str) -> Result<()> {
+    run(
+        &tc_bin(),
+        &[
+            "filter", "add", "dev", iface, "ingress", "pref", INGRESS_REDIRECT_PRIO, "matchall",
+            "action", "mirred", "egress", "redirect", "dev", ifb,
+        ],
+    )
+}
+
+/// Remove the `mirred` ingress redirect filter (stops sending ingress to IFB).
+pub fn del_ingress_redirect(iface: &str) {
+    run_ignore(
+        &tc_bin(),
+        &["filter", "del", "dev", iface, "ingress", "pref", INGRESS_REDIRECT_PRIO],
+    );
+}
+
 /// Bring up the IFB device and build its HTB root for the eBPF ingress path.
 ///
-/// Reserved for the network-namespace-validated eBPF download-shaping path; not
-/// used on the live interface (the `bpf_redirect` ingress approach can blackhole
-/// traffic and must be proven in isolation first).
-#[allow(dead_code)]
 pub fn ifb_root(ifb: &str, host_down_bps: Option<u64>) -> Result<()> {
     let tc = tc_bin();
     let ip = ip_bin();
@@ -143,8 +165,6 @@ pub fn ifb_root(ifb: &str, host_down_bps: Option<u64>) -> Result<()> {
 }
 
 /// Add a per-app ingress HTB class `1:<minor>` on the IFB device.
-/// Reserved for the netns-validated eBPF download-shaping path.
-#[allow(dead_code)]
 pub fn ifb_app_class(ifb: &str, minor: u16, rate_bps: u64, ceil_bps: u64) -> Result<()> {
     let tc = tc_bin();
     let classid = format!("1:{minor:x}");
@@ -165,15 +185,6 @@ pub fn ifb_clear(ifb: &str) {
     let tc = tc_bin();
     run_ignore(&tc, &["qdisc", "del", "dev", ifb, "root"]);
     run_ignore(&ip_bin(), &["link", "del", ifb]);
-}
-
-/// Resolve an interface name to its ifindex.
-/// Reserved for the netns-validated eBPF download-shaping path.
-#[allow(dead_code)]
-pub fn ifindex(iface: &str) -> Option<u32> {
-    std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 /// Apply an egress (upload) rate cap on `iface`.

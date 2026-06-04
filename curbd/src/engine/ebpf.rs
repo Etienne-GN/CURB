@@ -10,9 +10,14 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
 use aya::maps::HashMap as BpfHashMap;
+use aya::programs::tc::{NlOptions, TcAttachOptions};
 use aya::programs::{tc, SchedClassifier, TcAttachType};
 use aya::Ebpf;
 use tracing::info;
+
+/// Netlink priority for the ingress set-priority filter; the `mirred` redirect
+/// filter is added by `tc` at a higher number so it runs after this one.
+pub const INGRESS_BPF_PRIORITY: u16 = 1;
 
 /// The classifier object, compiled by `build.rs` (empty if clang was absent).
 static BPF_OBJ: &[u8] = aya::include_bytes_aligned!(env!("CURB_BPF_OBJ"));
@@ -25,20 +30,23 @@ pub struct EbpfShaper {
 }
 
 impl EbpfShaper {
-    /// Load the classifier and attach the **egress** hook on `iface`.
+    /// Load the classifier and attach the egress hook (always) plus, when
+    /// `ingress` is set, the **set-priority-only** ingress filter.
     ///
-    /// Only egress is attached: it is self-contained (set `skb->priority`, never
-    /// drop or redirect) and cannot disrupt connectivity. The ingress program
-    /// exists in the object but is intentionally NOT attached on a live
-    /// interface — its IFB redirect can blackhole inbound traffic and must only
-    /// be exercised in an isolated network namespace.
-    pub fn attach(iface: &str) -> Result<Self> {
+    /// Egress is self-contained (set `skb->priority`, never drop/redirect) and
+    /// safe. The ingress filter (`curb_ingress_setprio`) only sets priority and
+    /// returns `TC_ACT_UNSPEC`; it does NOT redirect — a separate `tc mirred`
+    /// filter (added by the engine when download shaping is active) performs the
+    /// reinjection-correct redirect. The dangerous `bpf_redirect` program is
+    /// never attached. `ingress` is gated by an off-by-default flag and must be
+    /// validated in a network namespace before use on a real NIC.
+    pub fn attach(iface: &str, ingress: bool) -> Result<Self> {
         if BPF_OBJ.is_empty() {
             return Err(anyhow!("no eBPF object (clang unavailable at build time)"));
         }
         let mut bpf = Ebpf::load(BPF_OBJ).context("loading eBPF classifier")?;
 
-        // clsact provides the egress hook and coexists with the root HTB qdisc.
+        // clsact provides the egress + ingress hooks and coexists with HTB.
         let _ = tc::qdisc_add_clsact(iface);
 
         let egress: &mut SchedClassifier = bpf
@@ -50,7 +58,27 @@ impl EbpfShaper {
             .attach(iface, TcAttachType::Egress)
             .context("attaching curb_egress")?;
 
-        info!(iface, "eBPF egress classifier attached");
+        if ingress {
+            let setprio: &mut SchedClassifier = bpf
+                .program_mut("curb_ingress_setprio")
+                .ok_or_else(|| anyhow!("curb_ingress_setprio program missing"))?
+                .try_into()?;
+            setprio.load().context("loading curb_ingress_setprio")?;
+            setprio
+                .attach_with_options(
+                    iface,
+                    TcAttachType::Ingress,
+                    TcAttachOptions::Netlink(NlOptions {
+                        priority: INGRESS_BPF_PRIORITY,
+                        handle: 0,
+                    }),
+                )
+                .context("attaching curb_ingress_setprio")?;
+            info!(iface, "eBPF egress + ingress(set-priority) classifiers attached");
+        } else {
+            info!(iface, "eBPF egress classifier attached");
+        }
+
         Ok(Self {
             bpf: Mutex::new(bpf),
         })

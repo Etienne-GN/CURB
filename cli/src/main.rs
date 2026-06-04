@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
-use curb_proto::{AppStat, Client, HostTotals, LimiterState, MonitorSnapshot, Request, Response};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use curb_proto::{AppStat, Client, HostTotals, LimiterState, MonitorSnapshot, Request, Response, Scope};
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +57,9 @@ enum AppCmd {
         target: String,
         #[command(flatten)]
         rates: HostLimitArgs,
+        /// Which traffic the limit applies to.
+        #[arg(long, value_enum, default_value_t = ScopeArg::Both)]
+        scope: ScopeArg,
     },
     /// Remove an application's rule.
     Clear {
@@ -65,6 +68,35 @@ enum AppCmd {
     },
     /// List configured per-application rules.
     List,
+}
+
+/// CLI mirror of [`Scope`] for clap parsing.
+#[derive(Clone, Copy, ValueEnum)]
+enum ScopeArg {
+    /// All remotes.
+    Both,
+    /// Only LAN (private) remotes.
+    Lan,
+    /// Only Internet (public) remotes.
+    Internet,
+}
+
+impl From<ScopeArg> for Scope {
+    fn from(s: ScopeArg) -> Self {
+        match s {
+            ScopeArg::Both => Scope::Both,
+            ScopeArg::Lan => Scope::Lan,
+            ScopeArg::Internet => Scope::Internet,
+        }
+    }
+}
+
+fn scope_label(s: Scope) -> &'static str {
+    match s {
+        Scope::Both => "both",
+        Scope::Lan => "LAN",
+        Scope::Internet => "internet",
+    }
 }
 
 #[derive(Subcommand)]
@@ -137,14 +169,14 @@ async fn main() -> Result<()> {
 /// Handle the `app` subcommands.
 async fn run_app(client: &mut Client, cmd: AppCmd) -> Result<()> {
     let req = match cmd {
-        AppCmd::Limit { target, rates } => {
+        AppCmd::Limit { target, rates, scope } => {
             let down_bps = rates.down.as_deref().map(parse_rate).transpose().context("parsing --down")?;
             let up_bps = rates.up.as_deref().map(parse_rate).transpose().context("parsing --up")?;
             if down_bps.is_none() && up_bps.is_none() {
                 bail!("specify at least one of --down or --up");
             }
             let exe = resolve_exe(client, &target).await?;
-            Request::SetAppLimit { exe, down_bps, up_bps }
+            Request::SetAppLimit { exe, down_bps, up_bps, scope: scope.into() }
         }
         AppCmd::Clear { target } => {
             let exe = resolve_exe(client, &target).await?;
@@ -198,17 +230,18 @@ fn print_app_limits(limits: &[curb_proto::AppLimit]) {
     }
     let fmt = |c: Option<u64>| c.map(format_rate).unwrap_or_else(|| "—".to_string());
     println!(
-        "  {:<24} {:>3}  {:>11}  {:>11}   EXECUTABLE",
-        "APPLICATION", "PID", "↓ LIMIT", "↑ LIMIT"
+        "  {:<22} {:>3}  {:>11}  {:>11}  {:>8}   EXECUTABLE",
+        "APPLICATION", "PID", "↓ LIMIT", "↑ LIMIT", "SCOPE"
     );
-    println!("  {}", "─".repeat(78));
+    println!("  {}", "─".repeat(84));
     for l in limits {
         println!(
-            "  {:<24} {:>3}  {:>11}  {:>11}   {}",
-            truncate(&l.name, 24),
+            "  {:<22} {:>3}  {:>11}  {:>11}  {:>8}   {}",
+            truncate(&l.name, 22),
             l.pids,
             fmt(l.down_bps),
             fmt(l.up_bps),
+            scope_label(l.scope),
             l.exe,
         );
     }

@@ -218,8 +218,9 @@ fn dispatch(req: Request, state: &State) -> Response {
             exe,
             down_bps,
             up_bps,
+            scope,
         } => match &state.engine {
-            Some(e) => match e.set_app_limit(exe, down_bps, up_bps) {
+            Some(e) => match e.set_app_limit(exe, down_bps, up_bps, scope) {
                 Ok(limits) => Response::AppLimits(limits),
                 Err(err) => Response::Error {
                     message: format!("{err:#}"),

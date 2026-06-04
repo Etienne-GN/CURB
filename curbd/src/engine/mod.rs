@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use curb_proto::{AppLimit, HostLimit, LimiterState};
+use curb_proto::{AppLimit, HostLimit, LimiterState, Scope};
 use tracing::{info, warn};
 
 /// Dedicated IFB device name for ingress shaping (≤15 chars).
@@ -37,6 +37,7 @@ struct AppRuleState {
     dir: String,
     down_bps: Option<u64>,
     up_bps: Option<u64>,
+    scope: Scope,
 }
 
 struct EngineInner {
@@ -126,6 +127,7 @@ impl Engine {
         exe: String,
         down_bps: Option<u64>,
         up_bps: Option<u64>,
+        scope: Scope,
     ) -> Result<Vec<AppLimit>> {
         let dir = sanitize_dir(&exe);
         cgroup::ensure_app(&dir).context("creating app cgroup")?;
@@ -138,6 +140,7 @@ impl Engine {
                     dir,
                     down_bps,
                     up_bps,
+                    scope,
                 },
             );
         }
@@ -168,6 +171,7 @@ impl Engine {
                 name: r.name.clone(),
                 down_bps: r.down_bps,
                 up_bps: r.up_bps,
+                scope: r.scope,
                 pids: cgroup::member_count(&r.dir),
             })
             .collect();
@@ -218,6 +222,7 @@ impl EngineInner {
                     cgroup_rel: cgroup::app_rel(&r.dir),
                     down_bps: r.down_bps,
                     up_bps: r.up_bps,
+                    scope: r.scope,
                 })
                 .collect()
         };

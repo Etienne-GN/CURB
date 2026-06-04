@@ -58,10 +58,13 @@ pub enum Request {
     GetLimiter,
     /// Set per-application caps by executable path (P3). `None` in a direction
     /// means unlimited. Creating a rule starts tracking the app's processes.
+    /// `scope` restricts the rule to LAN, Internet, or both (P4).
     SetAppLimit {
         exe: String,
         down_bps: Option<u64>,
         up_bps: Option<u64>,
+        #[serde(default)]
+        scope: Scope,
     },
     /// Remove a per-application rule and stop tracking the app (P3).
     ClearAppLimit { exe: String },
@@ -98,6 +101,21 @@ pub struct HostLimit {
     pub up_bps: Option<u64>,
 }
 
+/// Which traffic a limit applies to, by remote address class (P4).
+///
+/// LAN = private/link-local ranges (RFC1918, CGNAT, IPv6 ULA/link-local);
+/// Internet = everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Scope {
+    /// Apply to all remote addresses.
+    #[default]
+    Both,
+    /// Apply only to LAN (private) remotes.
+    Lan,
+    /// Apply only to Internet (public) remotes.
+    Internet,
+}
+
 /// A per-application bandwidth rule, identified by executable path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppLimit {
@@ -109,6 +127,9 @@ pub struct AppLimit {
     pub down_bps: Option<u64>,
     /// Outbound (upload) cap, bytes/sec; `None` = unlimited.
     pub up_bps: Option<u64>,
+    /// Which traffic the rule applies to.
+    #[serde(default)]
+    pub scope: Scope,
     /// Live processes currently tracked for this app.
     pub pids: u32,
 }

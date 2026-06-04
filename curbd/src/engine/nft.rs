@@ -15,7 +15,15 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Result};
 use tracing::debug;
 
+use curb_proto::Scope;
+
 use super::cgroup;
+
+/// Private/LAN address ranges (loopback + RFC1918 + CGNAT + link-local), IPv4.
+const V4_PRIVATE: &str =
+    "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10";
+/// Private/LAN address ranges (loopback + ULA + link-local), IPv6.
+const V6_PRIVATE: &str = "::1, fc00::/7, fe80::/10";
 
 /// One app's policing parameters for the ruleset generator.
 pub struct AppRule {
@@ -23,6 +31,27 @@ pub struct AppRule {
     pub cgroup_rel: String,
     pub down_bps: Option<u64>,
     pub up_bps: Option<u64>,
+    /// Restrict the rule to LAN, Internet, or both remotes.
+    pub scope: Scope,
+}
+
+/// Build the address-match clause(s) for a scope+direction, one per IP family.
+///
+/// `field` is the remote-address field for the direction: `saddr` for inbound
+/// (download, input hook), `daddr` for outbound (upload, output hook). Returns
+/// a clause per family; `Both` yields a single empty clause (match all).
+fn scope_clauses(scope: Scope, field: &str) -> Vec<String> {
+    match scope {
+        Scope::Both => vec![String::new()],
+        Scope::Lan => vec![
+            format!("ip {field} {{ {V4_PRIVATE} }} "),
+            format!("ip6 {field} {{ {V6_PRIVATE} }} "),
+        ],
+        Scope::Internet => vec![
+            format!("ip {field} != {{ {V4_PRIVATE} }} "),
+            format!("ip6 {field} != {{ {V6_PRIVATE} }} "),
+        ],
+    }
 }
 
 fn nft_bin() -> String {
@@ -50,25 +79,31 @@ pub fn apply(rules: &[AppRule]) -> Result<()> {
     s.push_str("add chain inet curb output { type filter hook output priority -150; }\n");
 
     for r in rules {
+        // Download: police inbound at the input hook; remote is the source.
         if let Some(down) = r.down_bps {
-            s.push_str(&format!(
-                "add rule inet curb input socket cgroupv2 level {lvl} \"{cg}\" \
-                 limit rate over {rate} bytes/second burst {burst} bytes drop\n",
-                lvl = cgroup::APP_LEVEL,
-                cg = r.cgroup_rel,
-                rate = down,
-                burst = burst(down),
-            ));
+            for clause in scope_clauses(r.scope, "saddr") {
+                s.push_str(&format!(
+                    "add rule inet curb input socket cgroupv2 level {lvl} \"{cg}\" \
+                     {clause}limit rate over {rate} bytes/second burst {burst} bytes drop\n",
+                    lvl = cgroup::APP_LEVEL,
+                    cg = r.cgroup_rel,
+                    rate = down,
+                    burst = burst(down),
+                ));
+            }
         }
+        // Upload: police outbound at the output hook; remote is the destination.
         if let Some(up) = r.up_bps {
-            s.push_str(&format!(
-                "add rule inet curb output socket cgroupv2 level {lvl} \"{cg}\" \
-                 limit rate over {rate} bytes/second burst {burst} bytes drop\n",
-                lvl = cgroup::APP_LEVEL,
-                cg = r.cgroup_rel,
-                rate = up,
-                burst = burst(up),
-            ));
+            for clause in scope_clauses(r.scope, "daddr") {
+                s.push_str(&format!(
+                    "add rule inet curb output socket cgroupv2 level {lvl} \"{cg}\" \
+                     {clause}limit rate over {rate} bytes/second burst {burst} bytes drop\n",
+                    lvl = cgroup::APP_LEVEL,
+                    cg = r.cgroup_rel,
+                    rate = up,
+                    burst = burst(up),
+                ));
+            }
         }
     }
     run_script(&s)

@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CURB — Network Monitor</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="error-banner" class="error-banner" style="display: none;">
+        <span>⚠ Cannot reach curbd — is the daemon running as root?</span>
+        <button onclick="document.getElementById('error-banner').style.display='none'">Dismiss</button>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <div class="logo">
+            <div class="logo-icon"></div>
+            CURB
+        </div>
+        <a href="#" class="nav-item">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+            Dashboard
+        </a>
+        <a href="#" class="nav-item active">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
+            Applications
+        </a>
+        <a href="#" class="nav-item">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+            Rules
+        </a>
+        <a href="#" class="nav-item">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+            Quotas
+        </a>
+        <a href="#" class="nav-item">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"></path><path d="M1.42 9a16 16 0 0 1 21.16 0"></path><path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path><line x1="12" y1="20" x2="12.01" y2="20"></line></svg>
+            Connections
+        </a>
+        <a href="#" class="nav-item" style="margin-top: auto;">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+            Settings
+        </a>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-container">
+        <!-- Top Bar -->
+        <div class="top-bar">
+            <div class="limiter-switch" id="master-limiter-toggle">
+                <span class="switch-label">Limiter</span>
+                <span class="switch-status" id="limiter-status-text">OFF</span>
+            </div>
+            
+            <div class="global-stats">
+                <div class="stat-item">
+                    <span class="stat-header">↓ Total</span>
+                    <div class="stat-value-container">
+                        <span class="stat-value download-text" id="global-down">0 bit</span>
+                        <svg class="stat-sparkline" id="global-down-spark"></svg>
+                    </div>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-header">↑ Total</span>
+                    <div class="stat-value-container">
+                        <span class="stat-value upload-text" id="global-up">0 bit</span>
+                        <svg class="stat-sparkline" id="global-up-spark"></svg>
+                    </div>
+                </div>
+            </div>
+
+            <div class="host-limit-chip" id="host-limit-toggle">
+                Host limit: <span id="host-limit-text">unlimited</span>
+            </div>
+
+            <div id="interface-name" style="font-size: 10px; color: var(--text-muted); text-transform: uppercase;"></div>
+
+            <input type="text" class="search-box" id="search-apps" placeholder="Search apps...">
+        </div>
+
+        <!-- Content Area -->
+        <div class="content">
+            <div class="table-container">
+                <table id="apps-table">
+                    <thead>
+                        <tr>
+                            <th style="width: 250px;">Application</th>
+                            <th>Status</th>
+                            <th>↓ Rate</th>
+                            <th>↑ Rate</th>
+                            <th>↓ Limit</th>
+                            <th>↑ Limit</th>
+                            <th>Scope</th>
+                            <th>Today</th>
+                        </tr>
+                    </thead>
+                    <tbody id="apps-body">
+                        <!-- Rows will be injected by JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Bottom Detail Strip -->
+        <div class="detail-strip">
+            <div class="detail-info" id="detail-app-info">
+                <div class="detail-title">—</div>
+                <div class="app-path">—</div>
+                <div style="margin-top: auto; display: flex; gap: 8px;">
+                    <!-- Status pills -->
+                </div>
+            </div>
+            <div class="detail-graphs">
+                <div class="graph-container">
+                    <div class="graph-header">
+                        <span class="graph-label">Download History (60s)</span>
+                        <span class="stat-value download-text" style="font-size: 13px;" id="detail-down-val">0 bit</span>
+                    </div>
+                    <div class="graph-canvas" id="graph-down">
+                        <svg width="100%" height="100%" preserveAspectRatio="none" id="svg-detail-down"></svg>
+                    </div>
+                </div>
+                <div class="graph-container">
+                    <div class="graph-header">
+                        <span class="graph-label">Upload History (60s)</span>
+                        <span class="stat-value upload-text" style="font-size: 13px;" id="detail-up-val">0 bit</span>
+                    </div>
+                    <div class="graph-canvas" id="graph-up">
+                        <svg width="100%" height="100%" preserveAspectRatio="none" id="svg-detail-up"></svg>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="main.js"></script>
+</body>
+</html>

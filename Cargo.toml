@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["proto", "curbd", "cli"]
-# "bpf" and "gui" are added in later phases (P1/P3 eBPF, GUI frontend).
+# The Tauri GUI (gui/src-tauri) is its own Cargo project with a different
+# dependency/edition profile; keep it out of this workspace.
+exclude = ["gui"]
 
 [workspace.package]
 version = "0.0.1"

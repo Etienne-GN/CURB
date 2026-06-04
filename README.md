@@ -41,15 +41,38 @@ CURB_SOCK=/tmp/curbd.sock cargo run -p curb -- ping     # terminal 2
 CURB_SOCK=/tmp/curbd.sock cargo run -p curb -- status
 ```
 
+## GUI
+
+A dark-themed Tauri desktop app lives in `gui/`. Its Rust backend
+(`gui/src-tauri`) is a thin client of `curbd` over the same control socket; the
+frontend polls live traffic and drives the limit/quota controls.
+
+```sh
+cd gui/src-tauri && cargo build      # needs Tauri's Linux deps (see below)
+# run against a daemon (set CURB_SOCK to match the running curbd):
+CURB_SOCK=/run/curbd.sock ./target/debug/gui
+```
+
+Build deps (Debian/Ubuntu): `pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev
+librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev`.
+
+![CURB GUI](design/gui-live.png)
+
 ## Roadmap
 
 - **P0 — Scaffold** ✅ workspace, IPC contract, daemon + CLI skeletons, `ping`/`status`.
-- **P1 — Live monitoring** eBPF accounting + per-app attribution, `curb top`, first GUI pass.
-- **P2 — Host-wide limits** tc HTB + IFB; live on/off and rate changes; in/out split.
-- **P3 — Per-app limits** cgroup + eBPF classifier → HTB; the core feature.
-- **P4 — LAN vs Internet** per-rule direction × scope.
-- **P5 — Quotas** cumulative per-app accounting + enforcement.
-- **P6 — GUI polish** dark theme, graphs, rule editor.
+- **P1 — Live monitoring** ✅ AF_PACKET capture + `/proc` per-app attribution, `curb top`.
+- **P2 — Host-wide limits** ✅ tc HTB + IFB; live on/off and rate changes; in/out split.
+- **P3 — Per-app limits** ✅ cgroup v2 + nftables `socket cgroupv2` policing.
+- **P4 — LAN vs Internet** ✅ per-rule scope matching.
+- **P5 — Quotas** ✅ per-app accounting + block-on-exceed + persistence.
+- **P6 — GUI** ✅ live dark-themed Tauri app wired to the daemon.
+
+### Future
+- eBPF (Aya) tc classifier for smooth per-app *shaping* (vs current policing).
+- proc-connector exec hook to place processes in their cgroup before they
+  connect (catch already-established connections).
+- Host-wide LAN/Internet scoping; per-app live graphs history; system tray.
 
 ## License
 

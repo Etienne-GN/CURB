@@ -43,6 +43,28 @@ enum Cmd {
     /// Host-wide bandwidth limits (master switch + total caps).
     #[command(subcommand)]
     Host(HostCmd),
+    /// Per-application bandwidth limits.
+    #[command(subcommand)]
+    App(AppCmd),
+}
+
+#[derive(Subcommand)]
+enum AppCmd {
+    /// Set caps for an application, by name (e.g. `firefox`) or full exe path.
+    /// Omit a direction to leave it unlimited.
+    Limit {
+        /// Application name or absolute executable path.
+        target: String,
+        #[command(flatten)]
+        rates: HostLimitArgs,
+    },
+    /// Remove an application's rule.
+    Clear {
+        /// Application name or absolute executable path.
+        target: String,
+    },
+    /// List configured per-application rules.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -106,9 +128,90 @@ async fn main() -> Result<()> {
         }
         Cmd::Top { interval } => run_top(&mut client, interval).await?,
         Cmd::Host(host) => run_host(&mut client, host).await?,
+        Cmd::App(app) => run_app(&mut client, app).await?,
     }
 
     Ok(())
+}
+
+/// Handle the `app` subcommands.
+async fn run_app(client: &mut Client, cmd: AppCmd) -> Result<()> {
+    let req = match cmd {
+        AppCmd::Limit { target, rates } => {
+            let down_bps = rates.down.as_deref().map(parse_rate).transpose().context("parsing --down")?;
+            let up_bps = rates.up.as_deref().map(parse_rate).transpose().context("parsing --up")?;
+            if down_bps.is_none() && up_bps.is_none() {
+                bail!("specify at least one of --down or --up");
+            }
+            let exe = resolve_exe(client, &target).await?;
+            Request::SetAppLimit { exe, down_bps, up_bps }
+        }
+        AppCmd::Clear { target } => {
+            let exe = resolve_exe(client, &target).await?;
+            Request::ClearAppLimit { exe }
+        }
+        AppCmd::List => Request::ListAppLimits,
+    };
+
+    match client.request(&req).await? {
+        Response::AppLimits(limits) => print_app_limits(&limits),
+        Response::Error { message } => bail!("daemon error: {message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Resolve a target to an absolute executable path. A path (contains `/`) is
+/// used as-is; otherwise it's matched against currently-running apps by name.
+async fn resolve_exe(client: &mut Client, target: &str) -> Result<String> {
+    if target.contains('/') {
+        return Ok(target.to_string());
+    }
+    let snap = fetch_apps(client).await?;
+    let want = target.to_ascii_lowercase();
+    let mut matches: Vec<String> = snap
+        .apps
+        .iter()
+        .filter(|a| !a.exe.is_empty())
+        .filter(|a| a.name.eq_ignore_ascii_case(&want) || a.name.to_ascii_lowercase().contains(&want))
+        .map(|a| a.exe.clone())
+        .collect();
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        1 => Ok(matches.pop().unwrap()),
+        0 => bail!(
+            "no running application named '{target}'. Run `curb apps` to see names, \
+             or pass the full executable path."
+        ),
+        _ => bail!(
+            "'{target}' matches multiple executables:\n  {}\nPass the full path to disambiguate.",
+            matches.join("\n  ")
+        ),
+    }
+}
+
+fn print_app_limits(limits: &[curb_proto::AppLimit]) {
+    if limits.is_empty() {
+        println!("no per-application rules configured");
+        return;
+    }
+    let fmt = |c: Option<u64>| c.map(format_rate).unwrap_or_else(|| "—".to_string());
+    println!(
+        "  {:<24} {:>3}  {:>11}  {:>11}   EXECUTABLE",
+        "APPLICATION", "PID", "↓ LIMIT", "↑ LIMIT"
+    );
+    println!("  {}", "─".repeat(78));
+    for l in limits {
+        println!(
+            "  {:<24} {:>3}  {:>11}  {:>11}   {}",
+            truncate(&l.name, 24),
+            l.pids,
+            fmt(l.down_bps),
+            fmt(l.up_bps),
+            l.exe,
+        );
+    }
 }
 
 /// Handle the `host` subcommands.

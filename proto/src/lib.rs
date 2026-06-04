@@ -56,6 +56,17 @@ pub enum Request {
     SetLimiterEnabled(bool),
     /// Read the current limiter state (P2).
     GetLimiter,
+    /// Set per-application caps by executable path (P3). `None` in a direction
+    /// means unlimited. Creating a rule starts tracking the app's processes.
+    SetAppLimit {
+        exe: String,
+        down_bps: Option<u64>,
+        up_bps: Option<u64>,
+    },
+    /// Remove a per-application rule and stop tracking the app (P3).
+    ClearAppLimit { exe: String },
+    /// List configured per-application rules (P3).
+    ListAppLimits,
 }
 
 /// The daemon's reply to a [`Request`].
@@ -69,6 +80,8 @@ pub enum Response {
     Apps(MonitorSnapshot),
     /// Reply to limiter requests ([`Request::GetLimiter`] etc.).
     Limiter(LimiterState),
+    /// Reply to per-application limit requests (P3).
+    AppLimits(Vec<AppLimit>),
     /// Generic success for requests with no payload.
     Ok,
     /// The request could not be served.
@@ -83,6 +96,21 @@ pub struct HostLimit {
     pub down_bps: Option<u64>,
     /// Outbound (upload) cap, bytes/sec; `None` = unlimited.
     pub up_bps: Option<u64>,
+}
+
+/// A per-application bandwidth rule, identified by executable path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppLimit {
+    /// Absolute executable path the rule targets.
+    pub exe: String,
+    /// Display name (executable basename).
+    pub name: String,
+    /// Inbound (download) cap, bytes/sec; `None` = unlimited.
+    pub down_bps: Option<u64>,
+    /// Outbound (upload) cap, bytes/sec; `None` = unlimited.
+    pub up_bps: Option<u64>,
+    /// Live processes currently tracked for this app.
+    pub pids: u32,
 }
 
 /// The limiter's current configuration and master-switch state.

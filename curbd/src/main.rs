@@ -114,8 +114,12 @@ async fn main() -> Result<()> {
 
     // Serve until interrupted, then clean up the socket file so the next start
     // is tidy.
-    let result = serve(&listener, state).await;
+    let result = serve(&listener, state.clone()).await;
 
+    // Remove all kernel shaping/policing state before exiting.
+    if let Some(engine) = &state.engine {
+        engine.shutdown();
+    }
     if let Err(e) = std::fs::remove_file(&path) {
         debug!(error = %e, "could not remove socket on shutdown");
     }
@@ -208,6 +212,32 @@ fn dispatch(req: Request, state: &State) -> Response {
                     message: format!("{err:#}"),
                 },
             },
+            None => engine_unavailable(),
+        },
+        Request::SetAppLimit {
+            exe,
+            down_bps,
+            up_bps,
+        } => match &state.engine {
+            Some(e) => match e.set_app_limit(exe, down_bps, up_bps) {
+                Ok(limits) => Response::AppLimits(limits),
+                Err(err) => Response::Error {
+                    message: format!("{err:#}"),
+                },
+            },
+            None => engine_unavailable(),
+        },
+        Request::ClearAppLimit { exe } => match &state.engine {
+            Some(e) => match e.clear_app_limit(&exe) {
+                Ok(limits) => Response::AppLimits(limits),
+                Err(err) => Response::Error {
+                    message: format!("{err:#}"),
+                },
+            },
+            None => engine_unavailable(),
+        },
+        Request::ListAppLimits => match &state.engine {
+            Some(e) => Response::AppLimits(e.list_app_limits()),
             None => engine_unavailable(),
         },
     }

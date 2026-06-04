@@ -1,87 +1,201 @@
-//! Host-wide traffic shaping engine (P2).
+//! Traffic shaping/policing engine.
 //!
-//! Implements rate limiting by shelling out to `tc`/`ip` (the pragmatic,
-//! debuggable path from the plan; a netlink rewrite can come later).
+//! * **Host-wide caps (P2)** — HTB shaping via `tc` on the physical interface
+//!   (egress) and an IFB device (ingress).
+//! * **Per-application caps (P3)** — cgroup v2 per app + nftables `socket
+//!   cgroupv2` policing in the input/output hooks. A background reconciler
+//!   keeps each app's freshly-spawned processes placed in its cgroup so rules
+//!   follow the application by executable path.
 //!
-//! * **Egress (upload)** is shaped directly: an HTB qdisc on the physical
-//!   interface with a single rate-capped class.
-//! * **Ingress (download)** can't be shaped directly on Linux, so we attach an
-//!   `ingress` qdisc to the interface, redirect all incoming packets to a
-//!   dedicated **IFB** device with `mirred`, and shape *that* device's egress
-//!   with HTB. This is precise-ish but best-effort (packets are already at the
-//!   NIC); documented as a known limitation.
-//!
-//! Each change tears the whole setup down and rebuilds it from the desired
-//! state — simple and idempotent. Requires `CAP_NET_ADMIN` (root).
+//! The host (tc) and per-app (nft) layers are independent and compose: an
+//! inbound packet is first IFB-shaped for the host cap, then policed by any
+//! per-app rule. Requires `CAP_NET_ADMIN` (root).
 
+mod cgroup;
+mod nft;
 mod tc;
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use curb_proto::{HostLimit, LimiterState};
+use curb_proto::{AppLimit, HostLimit, LimiterState};
 use tracing::{info, warn};
 
 /// Dedicated IFB device name for ingress shaping (≤15 chars).
 const IFB_DEV: &str = "ifbcurb";
+/// How often app cgroup membership is reconciled against running processes.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Owns the desired limiter state and reconciles it onto the kernel.
-pub struct Engine {
+/// A configured per-application rule.
+#[derive(Clone)]
+struct AppRuleState {
+    /// Display name (executable basename).
+    name: String,
+    /// Sanitized cgroup leaf directory name for this app.
+    dir: String,
+    down_bps: Option<u64>,
+    up_bps: Option<u64>,
+}
+
+struct EngineInner {
     iface: String,
+    /// Host-wide caps + master switch.
     state: Mutex<LimiterState>,
+    /// Per-application rules, keyed by executable path.
+    apps: Mutex<HashMap<String, AppRuleState>>,
+}
+
+/// Owns desired limiter state and reconciles it onto the kernel.
+#[derive(Clone)]
+pub struct Engine {
+    inner: Arc<EngineInner>,
 }
 
 impl Engine {
-    /// Detect the egress interface and create an idle (disabled) engine.
-    ///
-    /// No kernel changes are made until a limit is applied, so this succeeds
-    /// even unprivileged; the privileged operations fail later if `curbd`
-    /// lacks `CAP_NET_ADMIN`.
+    /// Detect the egress interface, create an idle engine, and start the
+    /// per-app membership reconciler. No kernel changes are made until a limit
+    /// is applied.
     pub fn new() -> Result<Self> {
         let iface = tc::default_interface().context("detecting default interface")?;
         info!(interface = %iface, "shaping engine bound to interface");
-        Ok(Self {
+        let inner = Arc::new(EngineInner {
             state: Mutex::new(LimiterState {
                 enabled: false,
                 host: HostLimit::default(),
                 interface: iface.clone(),
             }),
+            apps: Mutex::new(HashMap::new()),
             iface,
-        })
+        });
+
+        // Reconciler: keep app cgroups populated with their processes.
+        {
+            let inner = inner.clone();
+            std::thread::Builder::new()
+                .name("curb-reconcile".into())
+                .spawn(move || loop {
+                    std::thread::sleep(RECONCILE_INTERVAL);
+                    reconcile_membership(&inner);
+                })
+                .ok();
+        }
+
+        Ok(Self { inner })
     }
 
-    /// Current limiter state.
+    /// Current host limiter state.
     pub fn state(&self) -> LimiterState {
-        self.state.lock().unwrap().clone()
+        self.inner.state.lock().unwrap().clone()
     }
 
     /// Whether shaping is currently enabled.
     pub fn enabled(&self) -> bool {
-        self.state.lock().unwrap().enabled
+        self.inner.state.lock().unwrap().enabled
     }
+
+    // ---- Host-wide caps (P2) ----------------------------------------------
 
     /// Set host-wide caps and enable limiting.
     pub fn set_host_limit(&self, down_bps: Option<u64>, up_bps: Option<u64>) -> Result<LimiterState> {
-        let mut st = self.state.lock().unwrap();
-        st.host = HostLimit { down_bps, up_bps };
-        st.enabled = true;
-        self.reconcile(&st)?;
-        Ok(st.clone())
+        {
+            let mut st = self.inner.state.lock().unwrap();
+            st.host = HostLimit { down_bps, up_bps };
+            st.enabled = true;
+        }
+        self.inner.reconcile_host()?;
+        self.inner.reconcile_nft()?;
+        Ok(self.state())
     }
 
-    /// Toggle the master switch, keeping configured caps.
+    /// Toggle the master switch, keeping configured caps. Affects both the
+    /// host (tc) and per-app (nft) layers.
     pub fn set_enabled(&self, enabled: bool) -> Result<LimiterState> {
-        let mut st = self.state.lock().unwrap();
-        st.enabled = enabled;
-        self.reconcile(&st)?;
-        Ok(st.clone())
+        self.inner.state.lock().unwrap().enabled = enabled;
+        self.inner.reconcile_host()?;
+        self.inner.reconcile_nft()?;
+        Ok(self.state())
     }
 
-    /// Tear down any existing CURB qdiscs and rebuild from `st`.
-    fn reconcile(&self, st: &LimiterState) -> Result<()> {
-        self.teardown();
+    // ---- Per-application caps (P3) -----------------------------------------
+
+    /// Create or update a per-application rule and start tracking the app.
+    pub fn set_app_limit(
+        &self,
+        exe: String,
+        down_bps: Option<u64>,
+        up_bps: Option<u64>,
+    ) -> Result<Vec<AppLimit>> {
+        let dir = sanitize_dir(&exe);
+        cgroup::ensure_app(&dir).context("creating app cgroup")?;
+        {
+            let mut apps = self.inner.apps.lock().unwrap();
+            apps.insert(
+                exe.clone(),
+                AppRuleState {
+                    name: basename(&exe),
+                    dir,
+                    down_bps,
+                    up_bps,
+                },
+            );
+        }
+        // Configuring an app rule implies the limiter is on (mirrors host limits).
+        self.inner.state.lock().unwrap().enabled = true;
+        self.inner.reconcile_nft()?;
+        reconcile_membership(&self.inner); // place existing processes now
+        Ok(self.list_app_limits())
+    }
+
+    /// Remove a per-application rule and release its cgroup.
+    pub fn clear_app_limit(&self, exe: &str) -> Result<Vec<AppLimit>> {
+        let removed = self.inner.apps.lock().unwrap().remove(exe);
+        self.inner.reconcile_nft()?;
+        if let Some(rule) = removed {
+            cgroup::remove_app(&rule.dir);
+        }
+        Ok(self.list_app_limits())
+    }
+
+    /// List configured per-application rules with live process counts.
+    pub fn list_app_limits(&self) -> Vec<AppLimit> {
+        let apps = self.inner.apps.lock().unwrap();
+        let mut out: Vec<AppLimit> = apps
+            .iter()
+            .map(|(exe, r)| AppLimit {
+                exe: exe.clone(),
+                name: r.name.clone(),
+                down_bps: r.down_bps,
+                up_bps: r.up_bps,
+                pids: cgroup::member_count(&r.dir),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Remove all CURB kernel state. Call on daemon shutdown.
+    pub fn shutdown(&self) {
+        self.inner.teardown_host();
+        nft::clear();
+        let mut apps = self.inner.apps.lock().unwrap();
+        for rule in apps.values() {
+            cgroup::remove_app(&rule.dir);
+        }
+        apps.clear();
+        cgroup::remove_base();
+        info!("engine shut down; all shaping/policing removed");
+    }
+}
+
+impl EngineInner {
+    /// Rebuild host tc shaping from the current state.
+    fn reconcile_host(&self) -> Result<()> {
+        let st = self.state.lock().unwrap().clone();
+        self.teardown_host();
         if !st.enabled {
-            info!("limiter disabled; shaping removed");
+            info!("limiter disabled; host shaping removed");
             return Ok(());
         }
         if let Some(up) = st.host.up_bps {
@@ -90,27 +204,110 @@ impl Engine {
         if let Some(down) = st.host.down_bps {
             tc::apply_ingress(&self.iface, IFB_DEV, down).context("applying download cap")?;
         }
-        info!(
-            interface = %self.iface,
-            down = ?st.host.down_bps, up = ?st.host.up_bps,
-            "host limits applied"
-        );
+        info!(down = ?st.host.down_bps, up = ?st.host.up_bps, "host limits applied");
         Ok(())
     }
 
-    /// Remove all CURB shaping state. Best-effort; missing qdiscs are ignored.
-    fn teardown(&self) {
+    /// Rebuild the nftables per-app ruleset from the current apps + master switch.
+    fn reconcile_nft(&self) -> Result<()> {
+        let enabled = self.state.lock().unwrap().enabled;
+        let rules: Vec<nft::AppRule> = {
+            let apps = self.apps.lock().unwrap();
+            apps.values()
+                .map(|r| nft::AppRule {
+                    cgroup_rel: cgroup::app_rel(&r.dir),
+                    down_bps: r.down_bps,
+                    up_bps: r.up_bps,
+                })
+                .collect()
+        };
+        if !enabled || rules.is_empty() {
+            nft::clear();
+            return Ok(());
+        }
+        nft::apply(&rules).context("applying nft per-app rules")
+    }
+
+    fn teardown_host(&self) {
         tc::clear_egress(&self.iface);
         tc::clear_ingress(&self.iface, IFB_DEV);
     }
 }
 
+/// Place every running process of a tracked app into its cgroup.
+///
+/// Scans `/proc` once and matches each process's executable against the rule
+/// set, so newly launched instances of a limited app are captured within one
+/// reconcile tick. Children of an already-placed process inherit the cgroup.
+fn reconcile_membership(inner: &EngineInner) {
+    // exe -> cgroup dir for all tracked apps.
+    let wanted: HashMap<String, String> = {
+        let apps = inner.apps.lock().unwrap();
+        if apps.is_empty() {
+            return;
+        }
+        apps.iter().map(|(exe, r)| (exe.clone(), r.dir.clone())).collect()
+    };
+
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    for ent in entries.flatten() {
+        let Some(pid) = ent
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let exe = read_exe(pid);
+        if exe.is_empty() {
+            continue;
+        }
+        if let Some(dir) = wanted.get(&exe) {
+            cgroup::add_pid(dir, pid);
+        }
+    }
+}
+
+/// Read `/proc/<pid>/exe`, stripping the kernel's " (deleted)" suffix.
+fn read_exe(pid: u32) -> String {
+    let raw = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    raw.strip_suffix(" (deleted)")
+        .map(str::to_string)
+        .unwrap_or(raw)
+}
+
+fn basename(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// Derive a stable, filesystem-safe cgroup directory name from an exe path:
+/// `<sanitized-basename>-<hash8>` so distinct paths never collide.
+fn sanitize_dir(exe: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    exe.hash(&mut h);
+    let hash = h.finish();
+
+    let base: String = basename(exe)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(24)
+        .collect();
+    format!("{base}-{:08x}", (hash & 0xffff_ffff) as u32)
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
-        // Don't leave the user's interface shaped if the daemon exits.
-        if self.state.lock().map(|s| s.enabled).unwrap_or(false) {
+        // Only the last handle (besides the reconciler thread) cleans up; the
+        // daemon also calls shutdown() explicitly on graceful exit.
+        if Arc::strong_count(&self.inner) <= 2 && self.enabled() {
             warn!("engine dropping while enabled; removing shaping");
-            self.teardown();
+            self.inner.teardown_host();
+            nft::clear();
         }
     }
 }

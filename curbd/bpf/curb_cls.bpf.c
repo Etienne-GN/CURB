@@ -168,4 +168,27 @@ int curb_ingress(struct __sk_buff *skb)
     return bpf_redirect(ifb, 0);
 }
 
+// Ingress (SAFE variant): classify by the recorded flow and set skb->priority,
+// then return TC_ACT_UNSPEC so a following `tc` filter (matchall + mirred
+// egress redirect dev ifb) performs the actual, properly-reinjecting redirect.
+// This program never redirects or drops, so it cannot blackhole traffic.
+SEC("classifier")
+int curb_ingress_setprio(struct __sk_buff *skb)
+{
+    struct pkt5 p;
+    if (parse_pkt(skb, &p) == 0) {
+        struct flow_key k = {
+            .saddr = p.saddr,
+            .daddr = p.daddr,
+            .sport = p.sport,
+            .dport = p.dport,
+            .proto = p.proto,
+        };
+        __u32 *classid = bpf_map_lookup_elem(&flow_classid, &k);
+        if (classid)
+            skb->priority = *classid;
+    }
+    return TC_ACT_UNSPEC; // continue to the mirred redirect filter
+}
+
 char _license[] SEC("license") = "GPL";

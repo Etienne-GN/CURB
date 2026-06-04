@@ -116,6 +116,66 @@ pub fn clear_clsact(iface: &str) {
     run_ignore(&tc_bin(), &["qdisc", "del", "dev", iface, "clsact"]);
 }
 
+/// Bring up the IFB device and build its HTB root for the eBPF ingress path.
+///
+/// Reserved for the network-namespace-validated eBPF download-shaping path; not
+/// used on the live interface (the `bpf_redirect` ingress approach can blackhole
+/// traffic and must be proven in isolation first).
+#[allow(dead_code)]
+pub fn ifb_root(ifb: &str, host_down_bps: Option<u64>) -> Result<()> {
+    let tc = tc_bin();
+    let ip = ip_bin();
+    run_ignore(&ip, &["link", "add", ifb, "type", "ifb"]);
+    run(&ip, &["link", "set", "dev", ifb, "up"])
+        .map_err(|e| anyhow!("bringing up {ifb} (ifb module available?): {e}"))?;
+
+    let default_rate = host_down_bps.unwrap_or(LINE_RATE_BPS);
+    let rate = format!("{default_rate}bps");
+    run(&tc, &["qdisc", "add", "dev", ifb, "root", "handle", "1:", "htb", "default", "1"])?;
+    run(
+        &tc,
+        &[
+            "class", "add", "dev", ifb, "parent", "1:", "classid", "1:1", "htb", "rate", &rate,
+            "ceil", &rate,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Add a per-app ingress HTB class `1:<minor>` on the IFB device.
+/// Reserved for the netns-validated eBPF download-shaping path.
+#[allow(dead_code)]
+pub fn ifb_app_class(ifb: &str, minor: u16, rate_bps: u64, ceil_bps: u64) -> Result<()> {
+    let tc = tc_bin();
+    let classid = format!("1:{minor:x}");
+    let rate = format!("{rate_bps}bps");
+    let ceil = format!("{ceil_bps}bps");
+    run(
+        &tc,
+        &[
+            "class", "add", "dev", ifb, "parent", "1:", "classid", &classid, "htb", "rate", &rate,
+            "ceil", &ceil,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Tear down the IFB device used by the eBPF ingress path.
+pub fn ifb_clear(ifb: &str) {
+    let tc = tc_bin();
+    run_ignore(&tc, &["qdisc", "del", "dev", ifb, "root"]);
+    run_ignore(&ip_bin(), &["link", "del", ifb]);
+}
+
+/// Resolve an interface name to its ifindex.
+/// Reserved for the netns-validated eBPF download-shaping path.
+#[allow(dead_code)]
+pub fn ifindex(iface: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
 /// Apply an egress (upload) rate cap on `iface`.
 pub fn apply_egress(iface: &str, bps: u64) -> Result<()> {
     let rate = format!("{bps}bps");

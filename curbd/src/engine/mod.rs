@@ -99,13 +99,13 @@ impl Engine {
 
         // Try to load the eBPF egress classifier for smooth per-app upload
         // shaping; fall back to nftables policing if unavailable.
-        let shaper = match EbpfShaper::attach_egress(&iface) {
+        let shaper = match EbpfShaper::attach(&iface) {
             Ok(s) => {
-                info!("per-app upload: eBPF HTB shaping");
+                info!("per-app upload: eBPF HTB shaping; download: nftables policing");
                 Some(s)
             }
             Err(e) => {
-                warn!(error = %e, "eBPF egress shaping unavailable; using nftables policing for upload");
+                warn!(error = %e, "eBPF shaping unavailable; using nftables policing both ways");
                 None
             }
         };
@@ -207,6 +207,7 @@ impl Engine {
         // Configuring an app rule implies the limiter is on (mirrors host limits).
         self.inner.state.lock().unwrap().enabled = true;
         self.inner.reconcile_egress()?;
+        self.inner.reconcile_ingress()?;
         self.inner.reconcile_nft()?;
         reconcile_membership(&self.inner); // place existing processes now
         Ok(self.list_app_limits())
@@ -306,6 +307,7 @@ impl Engine {
     pub fn clear_app_limit(&self, exe: &str) -> Result<Vec<AppLimit>> {
         let removed = self.inner.apps.lock().unwrap().remove(exe);
         self.inner.reconcile_egress()?;
+        self.inner.reconcile_ingress()?;
         self.inner.reconcile_nft()?;
         if let Some(rule) = removed {
             cgroup::remove_app(&rule.dir);
@@ -335,6 +337,7 @@ impl Engine {
     pub fn shutdown(&self) {
         tc::clear_egress(&self.inner.iface);
         tc::clear_ingress(&self.inner.iface, IFB_DEV);
+        tc::ifb_clear(IFB_DEV);
         tc::clear_clsact(&self.inner.iface);
         nft::clear();
         let mut apps = self.inner.apps.lock().unwrap();
@@ -371,34 +374,45 @@ impl EngineInner {
         if !st.enabled {
             return Ok(());
         }
-        // Root + default class (host cap or line rate); per-app classes steered
-        // by the classifier.
+        // Root + default class (host cap or line rate); per-app upload classes
+        // steered by the classifier.
         tc::egress_root(&self.iface, st.host.up_bps).context("building egress HTB root")?;
-        let ceil = st.host.up_bps.unwrap_or(tc::LINE_RATE_BPS);
-        let apps: Vec<(u16, u64, String)> = {
+        let up_ceil = st.host.up_bps.unwrap_or(tc::LINE_RATE_BPS);
+
+        // Snapshot apps with any rate cap: each gets a shared cgroup->classid
+        // map entry (so egress records its flows for the ingress direction too),
+        // plus an egress class when it has an upload cap.
+        let apps: Vec<(u16, Option<u64>, Option<u64>, String)> = {
             let apps = self.apps.lock().unwrap();
             apps.values()
-                .filter_map(|r| r.up_bps.map(|up| (r.minor, up, r.dir.clone())))
+                .filter(|r| r.up_bps.is_some() || r.down_bps.is_some())
+                .map(|r| (r.minor, r.up_bps, r.down_bps, r.dir.clone()))
                 .collect()
         };
-        for (minor, up, dir) in apps {
-            tc::egress_app_class(&self.iface, minor, up, ceil.max(up))
-                .context("adding per-app egress class")?;
-            if let Some(cgid) = cgroup::cgroup_id(&dir) {
-                shaper.set_class(cgid, classid(minor)).ok();
+        for (minor, up, _down, dir) in &apps {
+            if let Some(up) = up {
+                tc::egress_app_class(&self.iface, *minor, *up, up_ceil.max(*up))
+                    .context("adding per-app egress class")?;
+            }
+            if let Some(cgid) = cgroup::cgroup_id(dir) {
+                shaper.set_class(cgid, classid(*minor)).ok();
             }
         }
-        info!(host_up = ?st.host.up_bps, "egress HTB + eBPF classes applied");
+        info!(host_up = ?st.host.up_bps, apps = apps.len(), "egress HTB + eBPF classes applied");
         Ok(())
     }
 
-    /// Rebuild ingress (download) host shaping via the IFB device.
+    /// Rebuild ingress (download) host shaping via the IFB device (P2 `mirred`
+    /// path — proven safe). Per-app download limits are handled by nftables
+    /// policing (see [`reconcile_nft`]); smooth eBPF download shaping is only
+    /// exercised in a network namespace, never on the live interface.
     fn reconcile_ingress(&self) -> Result<()> {
         let st = self.state.lock().unwrap().clone();
         tc::clear_ingress(&self.iface, IFB_DEV);
         if st.enabled {
             if let Some(down) = st.host.down_bps {
-                tc::apply_ingress(&self.iface, IFB_DEV, down).context("applying host download cap")?;
+                tc::apply_ingress(&self.iface, IFB_DEV, down)
+                    .context("applying host download cap")?;
             }
         }
         Ok(())
@@ -406,9 +420,9 @@ impl EngineInner {
 
     /// Rebuild the nftables per-app ruleset from the current apps + master switch.
     ///
-    /// When the eBPF shaper handles egress, the upload caps are omitted here
-    /// (they're HTB-shaped, not policed); nftables then covers per-app download
-    /// policing and quota blocks.
+    /// With the eBPF shaper active, upload is HTB-shaped so its caps are omitted
+    /// here; nftables then polices per-app *download* and enforces quota blocks.
+    /// Without eBPF, nftables polices both directions.
     fn reconcile_nft(&self) -> Result<()> {
         let enabled = self.state.lock().unwrap().enabled;
         let ebpf_egress = self.shaper.is_some();

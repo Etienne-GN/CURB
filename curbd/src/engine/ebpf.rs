@@ -25,23 +25,30 @@ pub struct EbpfShaper {
 }
 
 impl EbpfShaper {
-    /// Load the classifier and attach it to `iface` egress.
-    pub fn attach_egress(iface: &str) -> Result<Self> {
+    /// Load the classifier and attach the **egress** hook on `iface`.
+    ///
+    /// Only egress is attached: it is self-contained (set `skb->priority`, never
+    /// drop or redirect) and cannot disrupt connectivity. The ingress program
+    /// exists in the object but is intentionally NOT attached on a live
+    /// interface — its IFB redirect can blackhole inbound traffic and must only
+    /// be exercised in an isolated network namespace.
+    pub fn attach(iface: &str) -> Result<Self> {
         if BPF_OBJ.is_empty() {
             return Err(anyhow!("no eBPF object (clang unavailable at build time)"));
         }
         let mut bpf = Ebpf::load(BPF_OBJ).context("loading eBPF classifier")?;
 
-        // clsact coexists with the root HTB qdisc and provides the egress hook.
+        // clsact provides the egress hook and coexists with the root HTB qdisc.
         let _ = tc::qdisc_add_clsact(iface);
 
-        let prog: &mut SchedClassifier = bpf
+        let egress: &mut SchedClassifier = bpf
             .program_mut("curb_egress")
-            .ok_or_else(|| anyhow!("curb_egress program missing from object"))?
+            .ok_or_else(|| anyhow!("curb_egress program missing"))?
             .try_into()?;
-        prog.load().context("loading curb_egress")?;
-        prog.attach(iface, TcAttachType::Egress)
-            .context("attaching curb_egress to egress")?;
+        egress.load().context("loading curb_egress")?;
+        egress
+            .attach(iface, TcAttachType::Egress)
+            .context("attaching curb_egress")?;
 
         info!(iface, "eBPF egress classifier attached");
         Ok(Self {

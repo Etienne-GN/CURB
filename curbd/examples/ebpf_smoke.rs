@@ -24,6 +24,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let link = prog.attach(&iface, TcAttachType::Egress)?;
     println!("attached curb_egress to {iface} egress.");
 
+    // The risky one: sk_lookup-based ingress classifier must pass the verifier.
+    let iprog: &mut SchedClassifier = bpf.program_mut("curb_ingress").unwrap().try_into()?;
+    iprog.load()?;
+    let ilink = iprog.attach(&iface, TcAttachType::Ingress)?;
+    println!("attached curb_ingress to {iface} ingress (verifier passed!).");
+    drop(ilink);
+
     // Write a sample cgroup_id -> classid (1:16) entry.
     let mut map: BpfHashMap<_, u64, u32> =
         BpfHashMap::try_from(bpf.map_mut("cgroup_classid").unwrap())?;

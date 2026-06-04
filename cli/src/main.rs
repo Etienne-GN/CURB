@@ -7,9 +7,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
-use curb_proto::{AppStat, Client, HostTotals, MonitorSnapshot, Request, Response};
+use anyhow::{bail, Context, Result};
+use clap::{Args, Parser, Subcommand};
+use curb_proto::{AppStat, Client, HostTotals, LimiterState, MonitorSnapshot, Request, Response};
 
 #[derive(Parser)]
 #[command(
@@ -40,6 +40,32 @@ enum Cmd {
         #[arg(long, default_value_t = 1.0)]
         interval: f64,
     },
+    /// Host-wide bandwidth limits (master switch + total caps).
+    #[command(subcommand)]
+    Host(HostCmd),
+}
+
+#[derive(Subcommand)]
+enum HostCmd {
+    /// Set host-wide caps and enable limiting. Omitting a direction leaves it
+    /// unlimited (this is how you do inbound-only / outbound-only).
+    Limit(HostLimitArgs),
+    /// Disable limiting (keeps configured caps for the next `on`).
+    Off,
+    /// Re-enable limiting with the previously configured caps.
+    On,
+    /// Show the current limiter state.
+    Show,
+}
+
+#[derive(Args)]
+struct HostLimitArgs {
+    /// Download cap, e.g. `10mbit`, `500kbit`, `2MB`. Omit for unlimited.
+    #[arg(long, value_name = "RATE")]
+    down: Option<String>,
+    /// Upload cap, e.g. `2mbit`, `256kbit`, `1MB`. Omit for unlimited.
+    #[arg(long, value_name = "RATE")]
+    up: Option<String>,
 }
 
 #[tokio::main]
@@ -79,9 +105,52 @@ async fn main() -> Result<()> {
             print!("{}", render_table(&snap, usize::MAX));
         }
         Cmd::Top { interval } => run_top(&mut client, interval).await?,
+        Cmd::Host(host) => run_host(&mut client, host).await?,
     }
 
     Ok(())
+}
+
+/// Handle the `host` subcommands.
+async fn run_host(client: &mut Client, cmd: HostCmd) -> Result<()> {
+    let req = match &cmd {
+        HostCmd::Limit(args) => {
+            let down_bps = args
+                .down
+                .as_deref()
+                .map(parse_rate)
+                .transpose()
+                .context("parsing --down")?;
+            let up_bps = args
+                .up
+                .as_deref()
+                .map(parse_rate)
+                .transpose()
+                .context("parsing --up")?;
+            if down_bps.is_none() && up_bps.is_none() {
+                bail!("specify at least one of --down or --up");
+            }
+            Request::SetHostLimit { down_bps, up_bps }
+        }
+        HostCmd::Off => Request::SetLimiterEnabled(false),
+        HostCmd::On => Request::SetLimiterEnabled(true),
+        HostCmd::Show => Request::GetLimiter,
+    };
+
+    match client.request(&req).await? {
+        Response::Limiter(state) => print_limiter(&state),
+        Response::Error { message } => bail!("daemon error: {message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn print_limiter(s: &LimiterState) {
+    let sw = if s.enabled { "ON" } else { "OFF" };
+    let fmt = |c: Option<u64>| c.map(format_rate).unwrap_or_else(|| "unlimited".to_string());
+    println!("limiter  : {sw}   (interface {})", s.interface);
+    println!("  ↓ down : {}", fmt(s.host.down_bps));
+    println!("  ↑ up   : {}", fmt(s.host.up_bps));
 }
 
 /// Fetch a single live snapshot, mapping protocol errors to anyhow.
@@ -177,6 +246,45 @@ fn render_table(snap: &MonitorSnapshot, max_rows: usize) -> String {
     out
 }
 
+/// Parse a human rate string into **bytes per second**.
+///
+/// Accepts bit units (`kbit`, `mbit`, `gbit`) and byte units (`kb`/`kbyte`,
+/// `mb`/`mbyte`, `gb`/`gbyte`); a bare number is bytes/sec. Case-insensitive,
+/// optional spaces, e.g. `10mbit` = 1_250_000 B/s, `2MB` = 2_097_152 B/s.
+fn parse_rate(s: &str) -> Result<u64> {
+    let t = s.trim().to_ascii_lowercase().replace(' ', "");
+    // Longest suffixes first so "mbit" matches before "mb".
+    const UNITS: &[(&str, f64)] = &[
+        ("gbit", 1e9 / 8.0),
+        ("mbit", 1e6 / 8.0),
+        ("kbit", 1e3 / 8.0),
+        ("bit", 1.0 / 8.0),
+        ("gbyte", (1u64 << 30) as f64),
+        ("mbyte", (1u64 << 20) as f64),
+        ("kbyte", (1u64 << 10) as f64),
+        ("gb", (1u64 << 30) as f64),
+        ("mb", (1u64 << 20) as f64),
+        ("kb", (1u64 << 10) as f64),
+        ("b", 1.0),
+    ];
+    for (suffix, factor) in UNITS {
+        if let Some(num) = t.strip_suffix(suffix) {
+            let v: f64 = num
+                .parse()
+                .with_context(|| format!("invalid number in rate '{s}'"))?;
+            if v < 0.0 {
+                bail!("rate cannot be negative: '{s}'");
+            }
+            return Ok((v * factor) as u64);
+        }
+    }
+    // No recognized unit: treat as bytes/sec.
+    let v: f64 = t
+        .parse()
+        .with_context(|| format!("unrecognized rate '{s}' (try e.g. 10mbit, 2MB)"))?;
+    Ok(v as u64)
+}
+
 /// Format a byte/second rate in bits/second (NetLimiter convention).
 fn format_rate(bytes_per_sec: u64) -> String {
     let bits = bytes_per_sec as f64 * 8.0;
@@ -214,6 +322,28 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
         t.push('…');
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bit_and_byte_rates() {
+        assert_eq!(parse_rate("10mbit").unwrap(), 1_250_000);
+        assert_eq!(parse_rate("8bit").unwrap(), 1);
+        assert_eq!(parse_rate("1kbit").unwrap(), 125);
+        assert_eq!(parse_rate("2MB").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_rate("512kb").unwrap(), 512 * 1024);
+        assert_eq!(parse_rate("1000").unwrap(), 1000); // bare = bytes/sec
+        assert_eq!(parse_rate("3 Mbit").unwrap(), 375_000);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_rate("fast").is_err());
+        assert!(parse_rate("-5mbit").is_err());
     }
 }
 

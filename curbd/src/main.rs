@@ -10,12 +10,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod engine;
 mod monitor;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use curb_proto::transport::Connection;
 use curb_proto::{socket_path, DaemonStatus, Request, Response, PROTOCOL_VERSION};
+use engine::Engine;
 use monitor::Monitor;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
@@ -38,6 +40,8 @@ struct State {
     started: Instant,
     /// Live traffic monitor; `None` if capture couldn't start (no CAP_NET_RAW).
     monitor: Option<Monitor>,
+    /// Host-wide shaping engine; `None` if no default interface was detected.
+    engine: Option<Engine>,
 }
 
 impl State {
@@ -47,8 +51,7 @@ impl State {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             pid: std::process::id(),
             uptime_secs: self.started.elapsed().as_secs(),
-            // No engine yet (P2); the master switch is reported as off.
-            limiter_enabled: false,
+            limiter_enabled: self.engine.as_ref().is_some_and(Engine::enabled),
         }
     }
 }
@@ -91,9 +94,20 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Initialize the shaping engine (detects the default interface; applies no
+    // kernel changes until a limit is set).
+    let engine = match Engine::new() {
+        Ok(e) => Some(e),
+        Err(e) => {
+            warn!(error = %e, "shaping engine unavailable (no default route?)");
+            None
+        }
+    };
+
     let state = Arc::new(State {
         started: Instant::now(),
         monitor,
+        engine,
     });
 
     info!(socket = %path.display(), version = env!("CARGO_PKG_VERSION"), "curbd listening");
@@ -174,5 +188,34 @@ fn dispatch(req: Request, state: &State) -> Response {
                     .to_string(),
             },
         },
+        Request::GetLimiter => match &state.engine {
+            Some(e) => Response::Limiter(e.state()),
+            None => engine_unavailable(),
+        },
+        Request::SetHostLimit { down_bps, up_bps } => match &state.engine {
+            Some(e) => match e.set_host_limit(down_bps, up_bps) {
+                Ok(state) => Response::Limiter(state),
+                Err(err) => Response::Error {
+                    message: format!("{err:#}"),
+                },
+            },
+            None => engine_unavailable(),
+        },
+        Request::SetLimiterEnabled(enabled) => match &state.engine {
+            Some(e) => match e.set_enabled(enabled) {
+                Ok(state) => Response::Limiter(state),
+                Err(err) => Response::Error {
+                    message: format!("{err:#}"),
+                },
+            },
+            None => engine_unavailable(),
+        },
+    }
+}
+
+fn engine_unavailable() -> Response {
+    Response::Error {
+        message: "shaping engine unavailable (curbd needs CAP_NET_ADMIN and a default route)"
+            .to_string(),
     }
 }

@@ -45,6 +45,17 @@ pub enum Request {
     GetStatus,
     /// Request the current live per-application traffic snapshot (P1).
     ListApps,
+    /// Set the host-wide rate caps and enable limiting (P2). `None` for a
+    /// direction means "unlimited", which is how inbound-only / outbound-only
+    /// limits are expressed.
+    SetHostLimit {
+        down_bps: Option<u64>,
+        up_bps: Option<u64>,
+    },
+    /// Flip the global master switch without changing configured caps (P2).
+    SetLimiterEnabled(bool),
+    /// Read the current limiter state (P2).
+    GetLimiter,
 }
 
 /// The daemon's reply to a [`Request`].
@@ -56,8 +67,33 @@ pub enum Response {
     Status(DaemonStatus),
     /// Reply to [`Request::ListApps`]: live per-application traffic.
     Apps(MonitorSnapshot),
+    /// Reply to limiter requests ([`Request::GetLimiter`] etc.).
+    Limiter(LimiterState),
+    /// Generic success for requests with no payload.
+    Ok,
     /// The request could not be served.
     Error { message: String },
+}
+
+/// Host-wide rate caps. `None` in a direction means unlimited (no shaping),
+/// which expresses inbound-only / outbound-only limits.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct HostLimit {
+    /// Inbound (download) cap, bytes/sec; `None` = unlimited.
+    pub down_bps: Option<u64>,
+    /// Outbound (upload) cap, bytes/sec; `None` = unlimited.
+    pub up_bps: Option<u64>,
+}
+
+/// The limiter's current configuration and master-switch state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimiterState {
+    /// Master switch: when false, no shaping is applied even if caps are set.
+    pub enabled: bool,
+    /// Configured host-wide caps.
+    pub host: HostLimit,
+    /// The interface CURB is shaping (e.g. `eno1`).
+    pub interface: String,
 }
 
 /// A point-in-time snapshot of the daemon's health and master switch.

@@ -12,6 +12,7 @@
 //! per-app rule. Requires `CAP_NET_ADMIN` (root).
 
 mod cgroup;
+mod ebpf;
 mod nft;
 mod tc;
 
@@ -21,12 +22,20 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use curb_proto::{AppLimit, HostLimit, LimiterState, Scope};
+use ebpf::EbpfShaper;
 use tracing::{info, warn};
 
 /// Dedicated IFB device name for ingress shaping (≤15 chars).
 const IFB_DEV: &str = "ifbcurb";
 /// How often app cgroup membership is reconciled against running processes.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+/// First HTB class minor assigned to per-app egress classes (1:10, 1:11, …).
+const FIRST_MINOR: u16 = 0x10;
+
+/// HTB class handle (`skb->priority`) for the given minor under root `1:`.
+fn classid(minor: u16) -> u32 {
+    (1u32 << 16) | minor as u32
+}
 
 /// A configured per-application rule.
 #[derive(Clone)]
@@ -40,6 +49,8 @@ struct AppRuleState {
     scope: Scope,
     /// Set by the quota manager when the app's budget is exceeded (P5).
     blocked: bool,
+    /// Stable HTB class minor for this app's eBPF egress shaping (E1).
+    minor: u16,
 }
 
 impl AppRuleState {
@@ -55,6 +66,21 @@ struct EngineInner {
     state: Mutex<LimiterState>,
     /// Per-application rules, keyed by executable path.
     apps: Mutex<HashMap<String, AppRuleState>>,
+    /// eBPF egress classifier; `None` falls back to nftables policing for
+    /// upload (E1). When present, per-app upload is HTB-shaped, not policed.
+    shaper: Option<EbpfShaper>,
+    /// Next HTB class minor to hand out.
+    next_minor: Mutex<u16>,
+}
+
+impl EngineInner {
+    /// Allocate a fresh, never-reused HTB class minor.
+    fn alloc_minor(&self) -> u16 {
+        let mut m = self.next_minor.lock().unwrap();
+        let v = *m;
+        *m = m.checked_add(1).unwrap_or(FIRST_MINOR);
+        v
+    }
 }
 
 /// Owns desired limiter state and reconciles it onto the kernel.
@@ -70,6 +96,20 @@ impl Engine {
     pub fn new() -> Result<Self> {
         let iface = tc::default_interface().context("detecting default interface")?;
         info!(interface = %iface, "shaping engine bound to interface");
+
+        // Try to load the eBPF egress classifier for smooth per-app upload
+        // shaping; fall back to nftables policing if unavailable.
+        let shaper = match EbpfShaper::attach_egress(&iface) {
+            Ok(s) => {
+                info!("per-app upload: eBPF HTB shaping");
+                Some(s)
+            }
+            Err(e) => {
+                warn!(error = %e, "eBPF egress shaping unavailable; using nftables policing for upload");
+                None
+            }
+        };
+
         let inner = Arc::new(EngineInner {
             state: Mutex::new(LimiterState {
                 enabled: false,
@@ -77,6 +117,8 @@ impl Engine {
                 interface: iface.clone(),
             }),
             apps: Mutex::new(HashMap::new()),
+            shaper,
+            next_minor: Mutex::new(FIRST_MINOR),
             iface,
         });
 
@@ -114,16 +156,18 @@ impl Engine {
             st.host = HostLimit { down_bps, up_bps };
             st.enabled = true;
         }
-        self.inner.reconcile_host()?;
+        self.inner.reconcile_egress()?;
+        self.inner.reconcile_ingress()?;
         self.inner.reconcile_nft()?;
         Ok(self.state())
     }
 
-    /// Toggle the master switch, keeping configured caps. Affects both the
-    /// host (tc) and per-app (nft) layers.
+    /// Toggle the master switch, keeping configured caps. Affects the egress
+    /// (HTB/eBPF), ingress (IFB), and per-app (nft) layers.
     pub fn set_enabled(&self, enabled: bool) -> Result<LimiterState> {
         self.inner.state.lock().unwrap().enabled = enabled;
-        self.inner.reconcile_host()?;
+        self.inner.reconcile_egress()?;
+        self.inner.reconcile_ingress()?;
         self.inner.reconcile_nft()?;
         Ok(self.state())
     }
@@ -142,8 +186,11 @@ impl Engine {
         cgroup::ensure_app(&dir).context("creating app cgroup")?;
         {
             let mut apps = self.inner.apps.lock().unwrap();
-            // Preserve a quota block if the app is already being tracked.
-            let blocked = apps.get(&exe).map(|r| r.blocked).unwrap_or(false);
+            // Preserve quota block + class minor if already tracked.
+            let (blocked, minor) = apps
+                .get(&exe)
+                .map(|r| (r.blocked, r.minor))
+                .unwrap_or((false, self.inner.alloc_minor()));
             apps.insert(
                 exe.clone(),
                 AppRuleState {
@@ -153,11 +200,13 @@ impl Engine {
                     up_bps,
                     scope,
                     blocked,
+                    minor,
                 },
             );
         }
         // Configuring an app rule implies the limiter is on (mirrors host limits).
         self.inner.state.lock().unwrap().enabled = true;
+        self.inner.reconcile_egress()?;
         self.inner.reconcile_nft()?;
         reconcile_membership(&self.inner); // place existing processes now
         Ok(self.list_app_limits())
@@ -172,6 +221,7 @@ impl Engine {
             let mut apps = self.inner.apps.lock().unwrap();
             if !apps.contains_key(exe) {
                 cgroup::ensure_app(&dir).context("creating app cgroup")?;
+                let minor = self.inner.alloc_minor();
                 apps.insert(
                     exe.to_string(),
                     AppRuleState {
@@ -181,6 +231,7 @@ impl Engine {
                         up_bps: None,
                         scope: Scope::Both,
                         blocked: false,
+                        minor,
                     },
                 );
             }
@@ -222,6 +273,7 @@ impl Engine {
                 }
                 None if blocked => {
                     cgroup::ensure_app(&dir).context("creating app cgroup")?;
+                    let minor = self.inner.alloc_minor();
                     apps.insert(
                         exe.to_string(),
                         AppRuleState {
@@ -231,6 +283,7 @@ impl Engine {
                             up_bps: None,
                             scope: Scope::Both,
                             blocked: true,
+                            minor,
                         },
                     );
                 }
@@ -252,6 +305,7 @@ impl Engine {
     /// Remove a per-application rule and release its cgroup.
     pub fn clear_app_limit(&self, exe: &str) -> Result<Vec<AppLimit>> {
         let removed = self.inner.apps.lock().unwrap().remove(exe);
+        self.inner.reconcile_egress()?;
         self.inner.reconcile_nft()?;
         if let Some(rule) = removed {
             cgroup::remove_app(&rule.dir);
@@ -279,7 +333,9 @@ impl Engine {
 
     /// Remove all CURB kernel state. Call on daemon shutdown.
     pub fn shutdown(&self) {
-        self.inner.teardown_host();
+        tc::clear_egress(&self.inner.iface);
+        tc::clear_ingress(&self.inner.iface, IFB_DEV);
+        tc::clear_clsact(&self.inner.iface);
         nft::clear();
         let mut apps = self.inner.apps.lock().unwrap();
         for rule in apps.values() {
@@ -292,34 +348,77 @@ impl Engine {
 }
 
 impl EngineInner {
-    /// Rebuild host tc shaping from the current state.
-    fn reconcile_host(&self) -> Result<()> {
+    /// Rebuild egress (upload) shaping: host default class + per-app classes.
+    ///
+    /// With the eBPF shaper present, per-app uploads are HTB-shaped (the
+    /// classifier steers them by `skb->priority`); without it, only the host
+    /// cap is shaped here and per-app upload is policed by nftables.
+    fn reconcile_egress(&self) -> Result<()> {
         let st = self.state.lock().unwrap().clone();
-        self.teardown_host();
+        tc::clear_egress(&self.iface);
+
+        let Some(shaper) = &self.shaper else {
+            // Fallback path: just the host upload cap.
+            if st.enabled {
+                if let Some(up) = st.host.up_bps {
+                    tc::apply_egress(&self.iface, up).context("applying host upload cap")?;
+                }
+            }
+            return Ok(());
+        };
+
+        shaper.clear_all().ok();
         if !st.enabled {
-            info!("limiter disabled; host shaping removed");
             return Ok(());
         }
-        if let Some(up) = st.host.up_bps {
-            tc::apply_egress(&self.iface, up).context("applying upload cap")?;
+        // Root + default class (host cap or line rate); per-app classes steered
+        // by the classifier.
+        tc::egress_root(&self.iface, st.host.up_bps).context("building egress HTB root")?;
+        let ceil = st.host.up_bps.unwrap_or(tc::LINE_RATE_BPS);
+        let apps: Vec<(u16, u64, String)> = {
+            let apps = self.apps.lock().unwrap();
+            apps.values()
+                .filter_map(|r| r.up_bps.map(|up| (r.minor, up, r.dir.clone())))
+                .collect()
+        };
+        for (minor, up, dir) in apps {
+            tc::egress_app_class(&self.iface, minor, up, ceil.max(up))
+                .context("adding per-app egress class")?;
+            if let Some(cgid) = cgroup::cgroup_id(&dir) {
+                shaper.set_class(cgid, classid(minor)).ok();
+            }
         }
-        if let Some(down) = st.host.down_bps {
-            tc::apply_ingress(&self.iface, IFB_DEV, down).context("applying download cap")?;
+        info!(host_up = ?st.host.up_bps, "egress HTB + eBPF classes applied");
+        Ok(())
+    }
+
+    /// Rebuild ingress (download) host shaping via the IFB device.
+    fn reconcile_ingress(&self) -> Result<()> {
+        let st = self.state.lock().unwrap().clone();
+        tc::clear_ingress(&self.iface, IFB_DEV);
+        if st.enabled {
+            if let Some(down) = st.host.down_bps {
+                tc::apply_ingress(&self.iface, IFB_DEV, down).context("applying host download cap")?;
+            }
         }
-        info!(down = ?st.host.down_bps, up = ?st.host.up_bps, "host limits applied");
         Ok(())
     }
 
     /// Rebuild the nftables per-app ruleset from the current apps + master switch.
+    ///
+    /// When the eBPF shaper handles egress, the upload caps are omitted here
+    /// (they're HTB-shaped, not policed); nftables then covers per-app download
+    /// policing and quota blocks.
     fn reconcile_nft(&self) -> Result<()> {
         let enabled = self.state.lock().unwrap().enabled;
+        let ebpf_egress = self.shaper.is_some();
         let rules: Vec<nft::AppRule> = {
             let apps = self.apps.lock().unwrap();
             apps.values()
                 .map(|r| nft::AppRule {
                     cgroup_rel: cgroup::app_rel(&r.dir),
                     down_bps: r.down_bps,
-                    up_bps: r.up_bps,
+                    up_bps: if ebpf_egress { None } else { r.up_bps },
                     scope: r.scope,
                     blocked: r.blocked,
                 })
@@ -330,11 +429,6 @@ impl EngineInner {
             return Ok(());
         }
         nft::apply(&rules).context("applying nft per-app rules")
-    }
-
-    fn teardown_host(&self) {
-        tc::clear_egress(&self.iface);
-        tc::clear_ingress(&self.iface, IFB_DEV);
     }
 }
 
@@ -410,7 +504,8 @@ impl Drop for Engine {
         // daemon also calls shutdown() explicitly on graceful exit.
         if Arc::strong_count(&self.inner) <= 2 && self.enabled() {
             warn!("engine dropping while enabled; removing shaping");
-            self.inner.teardown_host();
+            tc::clear_egress(&self.inner.iface);
+            tc::clear_ingress(&self.inner.iface, IFB_DEV);
             nft::clear();
         }
     }

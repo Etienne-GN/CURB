@@ -73,6 +73,49 @@ pub fn default_interface() -> Result<String> {
     Err(anyhow!("no default route interface found"))
 }
 
+/// Effective "unlimited" rate for the default class (~80 Gbit/s in bytes/sec).
+pub const LINE_RATE_BPS: u64 = 10_000_000_000;
+
+/// Build the egress HTB root with a default class (the host upload cap, or
+/// line rate when unlimited). Per-app classes are added under it with
+/// [`egress_app_class`]; the eBPF classifier steers each app's packets into its
+/// class via `skb->priority`. Used for the eBPF shaping path.
+pub fn egress_root(iface: &str, host_up_bps: Option<u64>) -> Result<()> {
+    let tc = tc_bin();
+    let default_rate = host_up_bps.unwrap_or(LINE_RATE_BPS);
+    let rate = format!("{default_rate}bps");
+    run(&tc, &["qdisc", "add", "dev", iface, "root", "handle", "1:", "htb", "default", "1"])?;
+    run(
+        &tc,
+        &[
+            "class", "add", "dev", iface, "parent", "1:", "classid", "1:1", "htb", "rate", &rate,
+            "ceil", &rate,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Add a per-app egress HTB class `1:<minor>` at `rate_bps` (ceil `ceil_bps`).
+pub fn egress_app_class(iface: &str, minor: u16, rate_bps: u64, ceil_bps: u64) -> Result<()> {
+    let tc = tc_bin();
+    let classid = format!("1:{minor:x}");
+    let rate = format!("{rate_bps}bps");
+    let ceil = format!("{ceil_bps}bps");
+    run(
+        &tc,
+        &[
+            "class", "add", "dev", iface, "parent", "1:", "classid", &classid, "htb", "rate",
+            &rate, "ceil", &ceil,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Remove the clsact qdisc (detaches the eBPF classifier).
+pub fn clear_clsact(iface: &str) {
+    run_ignore(&tc_bin(), &["qdisc", "del", "dev", iface, "clsact"]);
+}
+
 /// Apply an egress (upload) rate cap on `iface`.
 pub fn apply_egress(iface: &str, bps: u64) -> Result<()> {
     let rate = format!("{bps}bps");

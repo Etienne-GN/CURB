@@ -33,6 +33,16 @@ pub fn remove_base() {
     let _ = fs::remove_dir(format!("{CG_ROOT}/{CG_BASE}"));
 }
 
+/// The cgroup v2 id of an app's cgroup, as seen by eBPF's `bpf_*_cgroup_id`.
+///
+/// On cgroup v2 the kernfs id equals the directory's inode number, which is
+/// what `bpf_skb_cgroup_id` / `bpf_sk_cgroup_id` return. Used to key the
+/// classifier's cgroup→class map.
+pub fn cgroup_id(dir: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(app_path(dir)).ok().map(|m| m.ino())
+}
+
 /// Create the app's cgroup (and the base) if absent.
 pub fn ensure_app(dir: &str) -> Result<()> {
     fs::create_dir_all(app_path(dir))

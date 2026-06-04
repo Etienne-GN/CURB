@@ -1,0 +1,22 @@
+[Unit]
+Description=CURB — per-application bandwidth-control daemon
+Documentation=https://github.com/Etienne-GN/CURB
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/curbd
+Restart=on-failure
+RestartSec=2
+
+# The traffic engine (later phases) needs these to manage tc/qdiscs, eBPF
+# programs, and cgroups. Granted ambiently so curbd does not run fully as root.
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN
+
+# Members of the `curb` group may drive the daemon via /run/curbd.sock (0660).
+# Create the group during install: `groupadd -f curb`.
+Group=curb
+
+[Install]
+WantedBy=multi-user.target

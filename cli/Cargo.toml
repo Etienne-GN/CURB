@@ -1,0 +1,18 @@
+[package]
+name = "curb"
+description = "CURB CLI — control the per-application bandwidth engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "curb"
+path = "src/main.rs"
+
+[dependencies]
+curb-proto = { path = "../proto" }
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true

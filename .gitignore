@@ -1,0 +1,22 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# eBPF build artifacts (later phases)
+/bpf/target
+
+# Tauri / GUI (later phases)
+/gui/node_modules
+/gui/dist
+/gui/src-tauri/target
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local dev socket / state
+/run/
+*.sock

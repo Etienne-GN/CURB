@@ -1,0 +1,17 @@
+[package]
+name = "curb-proto"
+description = "CURB IPC contract and client library (the frozen wire protocol between curbd, the CLI, and the GUI)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+futures.workspace = true
+thiserror.workspace = true

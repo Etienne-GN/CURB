@@ -10,10 +10,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod monitor;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use curb_proto::transport::Connection;
 use curb_proto::{socket_path, DaemonStatus, Request, Response, PROTOCOL_VERSION};
+use monitor::Monitor;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -33,6 +36,8 @@ struct Args {
 /// Process-wide daemon state shared across connections.
 struct State {
     started: Instant,
+    /// Live traffic monitor; `None` if capture couldn't start (no CAP_NET_RAW).
+    monitor: Option<Monitor>,
 }
 
 impl State {
@@ -75,8 +80,20 @@ async fn main() -> Result<()> {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
         .with_context(|| format!("setting permissions on {}", path.display()))?;
 
+    // Start the live traffic monitor. If capture can't open (missing
+    // CAP_NET_RAW), keep serving — status/ping still work and ListApps reports
+    // the monitor as unavailable.
+    let monitor = match Monitor::start() {
+        Ok(m) => Some(m),
+        Err(e) => {
+            warn!(error = %e, "traffic monitor unavailable (need CAP_NET_RAW / run as root)");
+            None
+        }
+    };
+
     let state = Arc::new(State {
         started: Instant::now(),
+        monitor,
     });
 
     info!(socket = %path.display(), version = env!("CARGO_PKG_VERSION"), "curbd listening");
@@ -150,5 +167,12 @@ fn dispatch(req: Request, state: &State) -> Response {
     match req {
         Request::Ping => Response::Pong,
         Request::GetStatus => Response::Status(state.status()),
+        Request::ListApps => match &state.monitor {
+            Some(m) => Response::Apps(m.snapshot()),
+            None => Response::Error {
+                message: "traffic monitor unavailable (curbd needs CAP_NET_RAW; run as root)"
+                    .to_string(),
+            },
+        },
     }
 }

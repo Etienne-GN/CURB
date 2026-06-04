@@ -43,6 +43,8 @@ pub enum Request {
     Ping,
     /// Request a [`DaemonStatus`] snapshot.
     GetStatus,
+    /// Request the current live per-application traffic snapshot (P1).
+    ListApps,
 }
 
 /// The daemon's reply to a [`Request`].
@@ -52,6 +54,8 @@ pub enum Response {
     Pong,
     /// Reply to [`Request::GetStatus`].
     Status(DaemonStatus),
+    /// Reply to [`Request::ListApps`]: live per-application traffic.
+    Apps(MonitorSnapshot),
     /// The request could not be served.
     Error { message: String },
 }
@@ -70,6 +74,69 @@ pub struct DaemonStatus {
     /// Global master switch for limiting. Always `false` until P2 lands the
     /// traffic engine; surfaced now so the GUI can render the toggle early.
     pub limiter_enabled: bool,
+}
+
+/// How CURB is currently treating an application's traffic.
+///
+/// In P1 everything is [`AppStatus::Watching`]; the limited/throttled states
+/// arrive with the traffic engine (P2/P3) but are defined now so the GUI can
+/// render the pills without another protocol bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppStatus {
+    /// Observed only — no limit applied.
+    Watching,
+    /// A rate limit is configured and being enforced.
+    Limited,
+    /// Currently clamped to near-zero (e.g. quota exceeded).
+    Throttled,
+}
+
+/// Live traffic for a single application, identified by its executable path.
+///
+/// Rates are bytes per second over the last sampling interval; totals are bytes
+/// accumulated since the daemon started observing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppStat {
+    /// Absolute executable path — the stable application identity.
+    pub exe: String,
+    /// Display name (executable basename).
+    pub name: String,
+    /// Number of live processes currently attributed to this application.
+    pub pids: u32,
+    /// Current download (inbound) rate, bytes/sec.
+    pub down_bps: u64,
+    /// Current upload (outbound) rate, bytes/sec.
+    pub up_bps: u64,
+    /// Total bytes downloaded since observation began.
+    pub down_total: u64,
+    /// Total bytes uploaded since observation began.
+    pub up_total: u64,
+    /// Recent download rates (oldest→newest) for sparklines, bytes/sec.
+    pub down_spark: Vec<u32>,
+    /// Recent upload rates (oldest→newest) for sparklines, bytes/sec.
+    pub up_spark: Vec<u32>,
+    /// How CURB is treating this app's traffic.
+    pub status: AppStatus,
+}
+
+/// Aggregate host-wide traffic totals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostTotals {
+    pub down_bps: u64,
+    pub up_bps: u64,
+    pub down_total: u64,
+    pub up_total: u64,
+}
+
+/// A complete point-in-time view of live traffic, returned by [`Request::ListApps`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MonitorSnapshot {
+    /// Per-application stats, sorted by the daemon (busiest first).
+    pub apps: Vec<AppStat>,
+    /// Host-wide totals.
+    pub host: HostTotals,
+    /// Unix epoch milliseconds when this snapshot was produced.
+    pub timestamp_ms: u64,
 }
 
 /// Errors raised by the transport and client helpers.

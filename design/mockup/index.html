@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CURB — Network Monitor</title>
+    <style>
+        :root {
+            --app-bg: #0b0e14;
+            --surface: #131722;
+            --elevated: #1a2030;
+            --border: #232a39;
+            --text-primary: #e6e9ef;
+            --text-muted: #8a93a6;
+            --download: #38bdf8;
+            --upload: #fb923c;
+            --brand: #34d399;
+            --danger: #fb7185;
+            --lan: rgba(45, 212, 191, 0.15);
+            --lan-text: #2dd4bf;
+            --internet: rgba(129, 140, 248, 0.15);
+            --internet-text: #818cf8;
+            --font-main: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--app-bg);
+            color: var(--text-primary);
+            font-family: var(--font-main);
+            height: 100vh;
+            display: flex;
+            overflow: hidden;
+            font-size: 13px;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 220px;
+            background-color: var(--surface);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            padding: 24px 0;
+            flex-shrink: 0;
+        }
+
+        .logo {
+            padding: 0 24px 32px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 800;
+            font-size: 20px;
+            letter-spacing: -0.5px;
+            color: var(--text-primary);
+        }
+
+        .logo-icon {
+            width: 24px;
+            height: 24px;
+            background-color: var(--brand);
+            border-radius: 6px;
+        }
+
+        .nav-item {
+            padding: 10px 24px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            color: var(--text-muted);
+            text-decoration: none;
+            transition: all 0.2s;
+            border-left: 3px solid transparent;
+        }
+
+        .nav-item:hover {
+            background-color: var(--elevated);
+            color: var(--text-primary);
+        }
+
+        .nav-item.active {
+            color: var(--text-primary);
+            background-color: rgba(52, 211, 153, 0.05);
+            border-left-color: var(--brand);
+        }
+
+        .nav-icon {
+            width: 18px;
+            height: 18px;
+            opacity: 0.7;
+        }
+
+        /* Main Content */
+        .main-container {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        /* Top Bar */
+        .top-bar {
+            height: 64px;
+            background-color: var(--surface);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 24px;
+            gap: 32px;
+            flex-shrink: 0;
+        }
+
+        .limiter-switch {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background-color: var(--elevated);
+            padding: 6px 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            cursor: pointer;
+        }
+
+        .switch-label {
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+        }
+
+        .switch-status {
+            color: var(--brand);
+            font-weight: 800;
+        }
+
+        .global-stats {
+            display: flex;
+            gap: 24px;
+            flex-grow: 1;
+        }
+
+        .stat-item {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .stat-header {
+            font-size: 10px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            font-weight: 600;
+        }
+
+        .stat-value-container {
+            display: flex;
+            align-items: flex-end;
+            gap: 8px;
+        }
+
+        .stat-value {
+            font-family: "Courier New", Courier, monospace; /* Tabular numbers fallback */
+            font-variant-numeric: tabular-nums;
+            font-weight: 700;
+            font-size: 16px;
+        }
+
+        .download-text { color: var(--download); }
+        .upload-text { color: var(--upload); }
+
+        .stat-sparkline {
+            width: 60px;
+            height: 20px;
+        }
+
+        .host-limit-chip {
+            background-color: var(--elevated);
+            padding: 6px 12px;
+            border-radius: 20px;
+            border: 1px solid var(--border);
+            display: flex;
+            gap: 8px;
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
+        .host-limit-chip span {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        .search-box {
+            background-color: var(--app-bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 6px 12px;
+            width: 200px;
+            color: var(--text-primary);
+            outline: none;
+        }
+
+        /* Content Area */
+        .content {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        .table-container {
+            background-color: var(--surface);
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            overflow: hidden;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        th {
+            background-color: rgba(255, 255, 255, 0.02);
+            padding: 12px 16px;
+            color: var(--text-muted);
+            font-weight: 600;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        td {
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: middle;
+            height: 48px;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover {
+            background-color: var(--elevated);
+        }
+
+        tr.selected {
+            background-color: rgba(52, 211, 153, 0.05);
+            box-shadow: inset 3px 0 0 var(--brand);
+        }
+
+        /* App Column */
+        .app-cell {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .app-icon {
+            width: 28px;
+            height: 28px;
+            border-radius: 6px;
+            background-color: var(--elevated);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .app-info {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .app-name {
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .app-path {
+            font-size: 10px;
+            color: var(--text-muted);
+        }
+
+        /* Pill / Chip */
+        .pill {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            display: inline-block;
+        }
+
+        .pill-emerald { background-color: rgba(52, 211, 153, 0.15); color: var(--brand); }
+        .pill-muted { background-color: rgba(138, 147, 166, 0.15); color: var(--text-muted); }
+        .pill-rose { background-color: rgba(251, 113, 133, 0.15); color: var(--danger); }
+        .pill-lan { background-color: var(--lan); color: var(--lan-text); }
+        .pill-internet { background-color: var(--internet); color: var(--internet-text); }
+
+        .limit-chip {
+            background-color: var(--elevated);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-family: "Courier New", Courier, monospace;
+            font-variant-numeric: tabular-nums;
+            cursor: pointer;
+            min-width: 50px;
+            text-align: center;
+        }
+
+        .rate-cell {
+            font-family: "Courier New", Courier, monospace;
+            font-variant-numeric: tabular-nums;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 120px;
+        }
+
+        .inline-spark {
+            width: 40px;
+            height: 14px;
+            opacity: 0.6;
+        }
+
+        /* Quota Bar */
+        .quota-container {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            width: 100px;
+        }
+
+        .quota-bar-bg {
+            height: 4px;
+            background-color: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .quota-bar-fill {
+            height: 100%;
+            background-color: var(--brand);
+            border-radius: 2px;
+        }
+
+        .quota-bar-fill.danger {
+            background-color: var(--danger);
+        }
+
+        .quota-label {
+            font-size: 10px;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        /* Bottom Detail Strip */
+        .detail-strip {
+            height: 160px;
+            background-color: var(--surface);
+            border-top: 1px solid var(--border);
+            display: flex;
+            padding: 20px 24px;
+            gap: 32px;
+            flex-shrink: 0;
+        }
+
+        .detail-info {
+            width: 200px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .detail-title {
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .detail-graphs {
+            flex-grow: 1;
+            display: flex;
+            gap: 24px;
+        }
+
+        .graph-container {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .graph-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .graph-label {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+
+        .graph-canvas {
+            flex-grow: 1;
+            background-color: rgba(255, 255, 255, 0.02);
+            border-radius: 6px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        svg {
+            display: block;
+        }
+
+        polyline {
+            fill: none;
+            stroke-width: 2;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+
+        .area-fill {
+            stroke: none;
+            opacity: 0.1;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <div class="logo">
+            <div class="logo-icon"></div>
+            CURB
+        </div>
+        <a href="#" class="nav-item">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+            Dashboard
+        </a>
+        <a href="#" class="nav-item active">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
+            Applications
+        </a>
+        <a href="#" class="nav-item">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+            Rules
+        </a>
+        <a href="#" class="nav-item">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+            Quotas
+        </a>
+        <a href="#" class="nav-item">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"></path><path d="M1.42 9a16 16 0 0 1 21.16 0"></path><path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path><line x1="12" y1="20" x2="12.01" y2="20"></line></svg>
+            Connections
+        </a>
+        <a href="#" class="nav-item" style="margin-top: auto;">
+            <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+            Settings
+        </a>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-container">
+        <!-- Top Bar -->
+        <div class="top-bar">
+            <div class="limiter-switch">
+                <span class="switch-label">Limiter</span>
+                <span class="switch-status">ON</span>
+            </div>
+            
+            <div class="global-stats">
+                <div class="stat-item">
+                    <span class="stat-header">↓ Total</span>
+                    <div class="stat-value-container">
+                        <span class="stat-value download-text" id="global-down">24.5 Mbit</span>
+                        <svg class="stat-sparkline" id="global-down-spark"></svg>
+                    </div>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-header">↑ Total</span>
+                    <div class="stat-value-container">
+                        <span class="stat-value upload-text" id="global-up">1.2 Mbit</span>
+                        <svg class="stat-sparkline" id="global-up-spark"></svg>
+                    </div>
+                </div>
+            </div>
+
+            <div class="host-limit-chip">
+                Host limit: <span>↓ 100 Mbit / ↑ 20 Mbit</span>
+            </div>
+
+            <input type="text" class="search-box" placeholder="Search apps...">
+        </div>
+
+        <!-- Content Area -->
+        <div class="content">
+            <div class="table-container">
+                <table id="apps-table">
+                    <thead>
+                        <tr>
+                            <th style="width: 250px;">Application</th>
+                            <th>Status</th>
+                            <th>↓ Rate</th>
+                            <th>↑ Rate</th>
+                            <th>↓ Limit</th>
+                            <th>↑ Limit</th>
+                            <th>Scope</th>
+                            <th>Today</th>
+                        </tr>
+                    </thead>
+                    <tbody id="apps-body">
+                        <!-- Rows will be injected by JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Bottom Detail Strip -->
+        <div class="detail-strip">
+            <div class="detail-info" id="detail-app-info">
+                <div class="detail-title">Firefox</div>
+                <div class="app-path">/usr/lib/firefox/firefox</div>
+                <div style="margin-top: auto; display: flex; gap: 8px;">
+                    <div class="pill pill-emerald">Limited</div>
+                    <div class="pill pill-internet">Internet</div>
+                </div>
+            </div>
+            <div class="detail-graphs">
+                <div class="graph-container">
+                    <div class="graph-header">
+                        <span class="graph-label">Download History (60s)</span>
+                        <span class="stat-value download-text" style="font-size: 13px;" id="detail-down-val">12.4 Mbit</span>
+                    </div>
+                    <div class="graph-canvas" id="graph-down">
+                        <svg width="100%" height="100%" preserveAspectRatio="none" id="svg-detail-down"></svg>
+                    </div>
+                </div>
+                <div class="graph-container">
+                    <div class="graph-header">
+                        <span class="graph-label">Upload History (60s)</span>
+                        <span class="stat-value upload-text" style="font-size: 13px;" id="detail-up-val">0.8 Mbit</span>
+                    </div>
+                    <div class="graph-canvas" id="graph-up">
+                        <svg width="100%" height="100%" preserveAspectRatio="none" id="svg-detail-up"></svg>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const appsData = [
+            { name: "Firefox", path: "/usr/lib/firefox/firefox", status: "Limited", down: 12.4, up: 0.8, downLimit: "20 Mbit", upLimit: "5 Mbit", scope: ["Internet"], quota: 3.2, quotaCap: 10, color: "#3b82f6" },
+            { name: "Steam", path: "/usr/bin/steam", status: "Limited", down: 85.1, up: 2.3, downLimit: "100 Mbit", upLimit: "10 Mbit", scope: ["Internet"], quota: 42.1, quotaCap: 50, color: "#171a21" },
+            { name: "Spotify", path: "/usr/bin/spotify", status: "Watching", down: 0.4, up: 0.1, downLimit: "—", upLimit: "—", scope: ["Internet"], quota: 0.8, quotaCap: 5, color: "#1db954" },
+            { name: "Visual Studio Code", path: "/usr/share/code/code", status: "Watching", down: 0.1, up: 0.05, downLimit: "—", upLimit: "—", scope: ["Internet", "LAN"], quota: 0.4, quotaCap: 5, color: "#007acc" },
+            { name: "qBittorrent", path: "/usr/bin/qbittorrent", status: "Throttled", down: 4.8, up: 1.2, downLimit: "5 Mbit", upLimit: "2 Mbit", scope: ["Internet"], quota: 14.8, quotaCap: 15, color: "#3178c6" },
+            { name: "Discord", path: "/usr/bin/discord", status: "Watching", down: 0.3, up: 0.2, downLimit: "—", upLimit: "—", scope: ["Internet"], quota: 1.2, quotaCap: 5, color: "#5865f2" },
+            { name: "Dropbox", path: "/usr/bin/dropbox", status: "Limited", down: 0.0, up: 0.5, downLimit: "10 Mbit", upLimit: "1 Mbit", scope: ["Internet"], quota: 0.9, quotaCap: 2, color: "#0061ff" },
+            { name: "OBS Studio", path: "/usr/bin/obs", status: "Watching", down: 0.2, up: 6.5, downLimit: "—", upLimit: "—", scope: ["Internet"], quota: 12.4, quotaCap: 20, color: "#302e31" },
+            { name: "curl", path: "/usr/bin/curl", status: "Watching", down: 0.0, up: 0.0, downLimit: "—", upLimit: "—", scope: ["Internet"], quota: 0.1, quotaCap: 1, color: "#8a93a6" },
+            { name: "systemd-resolved", path: "/lib/systemd/systemd-resolved", status: "Watching", down: 0.01, up: 0.01, downLimit: "—", upLimit: "—", scope: ["LAN"], quota: 0.05, quotaCap: 1, color: "#8a93a6" }
+        ];
+
+        // History for sparklines and graphs
+        const historySize = 60;
+        appsData.forEach(app => {
+            app.downHistory = Array(historySize).fill(0).map(() => app.down * (0.8 + Math.random() * 0.4));
+            app.upHistory = Array(historySize).fill(0).map(() => app.up * (0.8 + Math.random() * 0.4));
+        });
+
+        const globalHistory = {
+            down: Array(historySize).fill(0),
+            up: Array(historySize).fill(0)
+        };
+
+        let selectedAppIndex = 0;
+
+        function formatRate(val) {
+            if (val >= 10) return val.toFixed(1) + " Mbit";
+            if (val >= 1) return val.toFixed(1) + " Mbit";
+            if (val > 0.01) return (val * 1024).toFixed(0) + " Kbit";
+            return "0 Kbit";
+        }
+
+        function createSparkline(svg, data, color, width = 40, height = 14) {
+            svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+            const max = Math.max(...data, 0.1);
+            const points = data.map((d, i) => {
+                const x = (i / (data.length - 1)) * width;
+                const y = height - (d / max) * height;
+                return `${x},${y}`;
+            }).join(" ");
+
+            svg.innerHTML = `<polyline points="${points}" stroke="${color}" />`;
+        }
+
+        function createAreaGraph(svg, data, color) {
+            const width = 1000;
+            const height = 100;
+            svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+            const max = Math.max(...data, 0.1);
+            const points = data.map((d, i) => {
+                const x = (i / (data.length - 1)) * width;
+                const y = height - (d / max) * height;
+                return `${x},${y}`;
+            });
+
+            const polylinePoints = points.join(" ");
+            const areaPoints = `0,${height} ${polylinePoints} ${width},${height}`;
+
+            svg.innerHTML = `
+                <polygon points="${areaPoints}" fill="${color}" class="area-fill" />
+                <polyline points="${polylinePoints}" stroke="${color}" />
+            `;
+        }
+
+        function renderTable() {
+            const tbody = document.getElementById("apps-body");
+            tbody.innerHTML = "";
+
+            appsData.forEach((app, index) => {
+                const tr = document.createElement("tr");
+                if (index === selectedAppIndex) tr.classList.add("selected");
+                
+                tr.onclick = () => {
+                    selectedAppIndex = index;
+                    renderTable();
+                    updateDetailStrip();
+                };
+
+                const statusClass = app.status === "Limited" ? "pill-emerald" : (app.status === "Throttled" ? "pill-rose" : "pill-muted");
+                const quotaPercent = Math.min((app.quota / app.quotaCap) * 100, 100);
+                const isOverQuota = app.quota >= app.quotaCap * 0.95;
+
+                tr.innerHTML = `
+                    <td>
+                        <div class="app-cell">
+                            <div class="app-icon" style="border-top: 2px solid ${app.color}">${app.name[0]}</div>
+                            <div class="app-info">
+                                <span class="app-name">${app.name}</span>
+                                <span class="app-path">${app.path}</span>
+                            </div>
+                        </div>
+                    </td>
+                    <td><span class="pill ${statusClass}">${app.status}</span></td>
+                    <td>
+                        <div class="rate-cell">
+                            <span class="download-text">${formatRate(app.down)}</span>
+                            <svg class="inline-spark" id="spark-down-${index}"></svg>
+                        </div>
+                    </td>
+                    <td>
+                        <div class="rate-cell">
+                            <span class="upload-text">${formatRate(app.up)}</span>
+                            <svg class="inline-spark" id="spark-up-${index}"></svg>
+                        </div>
+                    </td>
+                    <td><div class="limit-chip">${app.downLimit}</div></td>
+                    <td><div class="limit-chip">${app.upLimit}</div></td>
+                    <td>
+                        <div style="display: flex; gap: 4px;">
+                            ${app.scope.map(s => `<span class="pill pill-${s.toLowerCase()}">${s}</span>`).join("")}
+                        </div>
+                    </td>
+                    <td>
+                        <div class="quota-container">
+                            <div class="quota-bar-bg">
+                                <div class="quota-bar-fill ${isOverQuota ? 'danger' : ''}" style="width: ${quotaPercent}%"></div>
+                            </div>
+                            <span class="quota-label">${app.quota.toFixed(1)} / ${app.quotaCap} GB</span>
+                        </div>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+                
+                createSparkline(tr.querySelector(`#spark-down-${index}`), app.downHistory, "var(--download)");
+                createSparkline(tr.querySelector(`#spark-up-${index}`), app.upHistory, "var(--upload)");
+            });
+        }
+
+        function updateDetailStrip() {
+            const app = appsData[selectedAppIndex];
+            const info = document.getElementById("detail-app-info");
+            info.querySelector(".detail-title").textContent = app.name;
+            info.querySelector(".app-path").textContent = app.path;
+            
+            const pills = info.querySelector("div:last-child");
+            const statusClass = app.status === "Limited" ? "pill-emerald" : (app.status === "Throttled" ? "pill-rose" : "pill-muted");
+            pills.innerHTML = `
+                <div class="pill ${statusClass}">${app.status}</div>
+                ${app.scope.map(s => `<div class="pill pill-${s.toLowerCase()}">${s}</div>`).join("")}
+            `;
+
+            document.getElementById("detail-down-val").textContent = formatRate(app.down);
+            document.getElementById("detail-up-val").textContent = formatRate(app.up);
+
+            createAreaGraph(document.getElementById("svg-detail-down"), app.downHistory, "var(--download)");
+            createAreaGraph(document.getElementById("svg-detail-up"), app.upHistory, "var(--upload)");
+        }
+
+        function updateData() {
+            let totalDown = 0;
+            let totalUp = 0;
+
+            appsData.forEach(app => {
+                // Random walk
+                const downChange = (Math.random() - 0.5) * (app.down * 0.2 + 0.1);
+                const upChange = (Math.random() - 0.5) * (app.up * 0.2 + 0.05);
+                
+                app.down = Math.max(0, app.down + downChange);
+                app.up = Math.max(0, app.up + upChange);
+
+                // Caps for "Limited/Throttled" apps
+                if (app.status === "Throttled" || app.status === "Limited") {
+                    const limitVal = parseFloat(app.downLimit);
+                    if (!isNaN(limitVal) && app.down > limitVal) {
+                        app.down = limitVal * (0.95 + Math.random() * 0.05);
+                    }
+                }
+
+                app.downHistory.push(app.down);
+                app.downHistory.shift();
+                app.upHistory.push(app.up);
+                app.upHistory.shift();
+
+                totalDown += app.down;
+                totalUp += app.up;
+
+                // Slowly increase quota
+                app.quota += app.down * 0.0001;
+            });
+
+            globalHistory.down.push(totalDown);
+            globalHistory.down.shift();
+            globalHistory.up.push(totalUp);
+            globalHistory.up.shift();
+
+            document.getElementById("global-down").textContent = formatRate(totalDown);
+            document.getElementById("global-up").textContent = formatRate(totalUp);
+
+            createSparkline(document.getElementById("global-down-spark"), globalHistory.down, "var(--download)", 60, 20);
+            createSparkline(document.getElementById("global-up-spark"), globalHistory.up, "var(--upload)", 60, 20);
+
+            renderTable();
+            updateDetailStrip();
+        }
+
+        // Initial render
+        renderTable();
+        updateDetailStrip();
+
+        // Update loop
+        setInterval(updateData, 1000);
+    </script>
+</body>
+</html>

@@ -1,14 +1,15 @@
 //! `curb` — the CURB command-line client.
 //!
-//! A thin front-end over [`curb_proto::Client`]. P0 ships `ping` and `status`;
-//! `host`, `app`, `top`, and `quota` subcommands arrive with their phases.
+//! A thin front-end over [`curb_proto::Client`]. P0 shipped `ping`/`status`;
+//! P1 adds `apps` (one-shot live snapshot) and `top` (auto-refreshing view).
+//! `host`, `app`, and `quota` subcommands arrive with their phases.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use curb_proto::{Client, Request, Response};
+use curb_proto::{AppStat, Client, HostTotals, MonitorSnapshot, Request, Response};
 
 #[derive(Parser)]
 #[command(
@@ -31,6 +32,14 @@ enum Cmd {
     Ping,
     /// Show the daemon's status.
     Status,
+    /// Print a one-shot snapshot of live per-application traffic.
+    Apps,
+    /// Live, auto-refreshing per-application traffic (like `top`).
+    Top {
+        /// Refresh interval in seconds.
+        #[arg(long, default_value_t = 1.0)]
+        interval: f64,
+    },
 }
 
 #[tokio::main]
@@ -65,9 +74,147 @@ async fn main() -> Result<()> {
             Response::Error { message } => bail!("daemon error: {message}"),
             other => bail!("unexpected response to status: {other:?}"),
         },
+        Cmd::Apps => {
+            let snap = fetch_apps(&mut client).await?;
+            print!("{}", render_table(&snap, usize::MAX));
+        }
+        Cmd::Top { interval } => run_top(&mut client, interval).await?,
     }
 
     Ok(())
+}
+
+/// Fetch a single live snapshot, mapping protocol errors to anyhow.
+async fn fetch_apps(client: &mut Client) -> Result<MonitorSnapshot> {
+    match client.request(&Request::ListApps).await? {
+        Response::Apps(snap) => Ok(snap),
+        Response::Error { message } => bail!("daemon error: {message}"),
+        other => bail!("unexpected response to apps: {other:?}"),
+    }
+}
+
+/// Auto-refreshing table until interrupted with Ctrl-C.
+async fn run_top(client: &mut Client, interval: f64) -> Result<()> {
+    let interval = std::time::Duration::from_secs_f64(interval.max(0.1));
+    // Alternate screen buffer + hidden cursor for a clean live view.
+    print!("\x1b[?1049h\x1b[?25l");
+    let result = top_loop(client, interval).await;
+    // Restore the terminal no matter how we exit.
+    print!("\x1b[?25h\x1b[?1049l");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    result
+}
+
+async fn top_loop(client: &mut Client, interval: std::time::Duration) -> Result<()> {
+    loop {
+        let snap = fetch_apps(client).await?;
+        // Clear + home, then draw.
+        print!("\x1b[2J\x1b[H{}", render_table(&snap, 25));
+        println!("\n  refreshing every {:.1}s — Ctrl-C to quit", interval.as_secs_f64());
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+        }
+    }
+}
+
+/// Render the host header plus a per-application table, capped at `max_rows`.
+fn render_table(snap: &MonitorSnapshot, max_rows: usize) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let HostTotals {
+        down_bps,
+        up_bps,
+        down_total,
+        up_total,
+    } = snap.host;
+
+    let _ = writeln!(
+        out,
+        "  HOST   ↓ {:>11}  ↑ {:>11}     (total ↓ {} / ↑ {})",
+        format_rate(down_bps),
+        format_rate(up_bps),
+        format_bytes(down_total),
+        format_bytes(up_total),
+    );
+    let _ = writeln!(
+        out,
+        "  {:<28} {:>3}  {:>11}  {:>11}  {:>9}  {:>9}",
+        "APPLICATION", "PID", "↓ RATE", "↑ RATE", "↓ TOTAL", "↑ TOTAL"
+    );
+    let _ = writeln!(out, "  {}", "─".repeat(80));
+
+    if snap.apps.is_empty() {
+        let _ = writeln!(out, "  (no traffic observed yet)");
+        return out;
+    }
+
+    for app in snap.apps.iter().take(max_rows) {
+        let AppStat {
+            ref name,
+            pids,
+            down_bps,
+            up_bps,
+            down_total,
+            up_total,
+            ..
+        } = *app;
+        let _ = writeln!(
+            out,
+            "  {:<28} {:>3}  {:>11}  {:>11}  {:>9}  {:>9}",
+            truncate(name, 28),
+            pids,
+            format_rate(down_bps),
+            format_rate(up_bps),
+            format_bytes(down_total),
+            format_bytes(up_total),
+        );
+    }
+    out
+}
+
+/// Format a byte/second rate in bits/second (NetLimiter convention).
+fn format_rate(bytes_per_sec: u64) -> String {
+    let bits = bytes_per_sec as f64 * 8.0;
+    for (unit, scale) in [
+        ("Gbit", 1e9),
+        ("Mbit", 1e6),
+        ("Kbit", 1e3),
+    ] {
+        if bits >= scale {
+            return format!("{:.1} {}", bits / scale, unit);
+        }
+    }
+    format!("{bits:.0} bit")
+}
+
+/// Format a byte count in binary units (KB/MB/GB).
+fn format_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    for (unit, scale) in [
+        ("GB", 1u64 << 30),
+        ("MB", 1u64 << 20),
+        ("KB", 1u64 << 10),
+    ] {
+        if bytes >= scale {
+            return format!("{:.1} {}", b / scale as f64, unit);
+        }
+    }
+    format!("{bytes} B")
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
 }
 
 /// Render a duration in seconds as `1d 2h 3m 4s`, trimming leading zero units.

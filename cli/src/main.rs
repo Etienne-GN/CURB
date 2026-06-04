@@ -9,7 +9,10 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use curb_proto::{AppStat, Client, HostTotals, LimiterState, MonitorSnapshot, Request, Response, Scope};
+use curb_proto::{
+    AppStat, Client, Direction, HostTotals, LimiterState, MonitorSnapshot, QuotaPeriod,
+    QuotaStatus, Request, Response, Scope,
+};
 
 #[derive(Parser)]
 #[command(
@@ -46,6 +49,72 @@ enum Cmd {
     /// Per-application bandwidth limits.
     #[command(subcommand)]
     App(AppCmd),
+    /// Per-application data quotas (budget over a period; blocks when exceeded).
+    #[command(subcommand)]
+    Quota(QuotaCmd),
+}
+
+#[derive(Subcommand)]
+enum QuotaCmd {
+    /// Set a data quota for an application (by name or executable path).
+    Set {
+        /// Application name or absolute executable path.
+        target: String,
+        /// Data budget, e.g. `10GB`, `500MB`, `2GiB`.
+        #[arg(long)]
+        budget: String,
+        /// Reset period.
+        #[arg(long, value_enum, default_value_t = PeriodArg::Daily)]
+        period: PeriodArg,
+        /// Which direction(s) to count.
+        #[arg(long, value_enum, default_value_t = DirArg::Both)]
+        direction: DirArg,
+    },
+    /// Remove an application's quota.
+    Clear {
+        /// Application name or absolute executable path.
+        target: String,
+    },
+    /// List quotas with live usage.
+    List,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PeriodArg {
+    Hourly,
+    Daily,
+    Weekly,
+    Monthly,
+    Total,
+}
+
+impl From<PeriodArg> for QuotaPeriod {
+    fn from(p: PeriodArg) -> Self {
+        match p {
+            PeriodArg::Hourly => QuotaPeriod::Hourly,
+            PeriodArg::Daily => QuotaPeriod::Daily,
+            PeriodArg::Weekly => QuotaPeriod::Weekly,
+            PeriodArg::Monthly => QuotaPeriod::Monthly,
+            PeriodArg::Total => QuotaPeriod::Total,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DirArg {
+    Down,
+    Up,
+    Both,
+}
+
+impl From<DirArg> for Direction {
+    fn from(d: DirArg) -> Self {
+        match d {
+            DirArg::Down => Direction::Down,
+            DirArg::Up => Direction::Up,
+            DirArg::Both => Direction::Both,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -161,9 +230,128 @@ async fn main() -> Result<()> {
         Cmd::Top { interval } => run_top(&mut client, interval).await?,
         Cmd::Host(host) => run_host(&mut client, host).await?,
         Cmd::App(app) => run_app(&mut client, app).await?,
+        Cmd::Quota(q) => run_quota(&mut client, q).await?,
     }
 
     Ok(())
+}
+
+/// Handle the `quota` subcommands.
+async fn run_quota(client: &mut Client, cmd: QuotaCmd) -> Result<()> {
+    let req = match cmd {
+        QuotaCmd::Set {
+            target,
+            budget,
+            period,
+            direction,
+        } => {
+            let budget_bytes = parse_size(&budget).context("parsing --budget")?;
+            let exe = resolve_exe(client, &target).await?;
+            Request::SetQuota {
+                exe,
+                budget_bytes,
+                period: period.into(),
+                direction: direction.into(),
+            }
+        }
+        QuotaCmd::Clear { target } => {
+            let exe = resolve_exe(client, &target).await?;
+            Request::ClearQuota { exe }
+        }
+        QuotaCmd::List => Request::ListQuotas,
+    };
+
+    match client.request(&req).await? {
+        Response::Quotas(quotas) => print_quotas(&quotas),
+        Response::Error { message } => bail!("daemon error: {message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+fn print_quotas(quotas: &[QuotaStatus]) {
+    if quotas.is_empty() {
+        println!("no quotas configured");
+        return;
+    }
+    println!(
+        "  {:<20} {:>9} {:>9} {:>5}  {:<8} {:<5} {:>9}  STATUS",
+        "APPLICATION", "USED", "BUDGET", "%", "PERIOD", "DIR", "RESETS"
+    );
+    println!("  {}", "─".repeat(86));
+    for q in quotas {
+        let pct = if q.budget_bytes > 0 {
+            (q.used_bytes as f64 / q.budget_bytes as f64 * 100.0).min(999.0)
+        } else {
+            0.0
+        };
+        let resets = match q.resets_in_secs {
+            Some(s) => format_uptime(s),
+            None => "—".to_string(),
+        };
+        let status = if q.exceeded { "BLOCKED" } else { "ok" };
+        println!(
+            "  {:<20} {:>9} {:>9} {:>4.0}%  {:<8} {:<5} {:>9}  {}",
+            truncate(&q.name, 20),
+            format_bytes(q.used_bytes),
+            format_bytes(q.budget_bytes),
+            pct,
+            period_label(q.period),
+            dir_label(q.direction),
+            resets,
+            status,
+        );
+    }
+}
+
+fn period_label(p: QuotaPeriod) -> &'static str {
+    match p {
+        QuotaPeriod::Hourly => "hourly",
+        QuotaPeriod::Daily => "daily",
+        QuotaPeriod::Weekly => "weekly",
+        QuotaPeriod::Monthly => "monthly",
+        QuotaPeriod::Total => "total",
+    }
+}
+
+fn dir_label(d: Direction) -> &'static str {
+    match d {
+        Direction::Down => "↓",
+        Direction::Up => "↑",
+        Direction::Both => "↓↑",
+    }
+}
+
+/// Parse a human data size into bytes (binary units): `B`, `KB`/`KiB`, `MB`,
+/// `GB`, `TB`. A bare number is bytes.
+fn parse_size(s: &str) -> Result<u64> {
+    let t = s.trim().to_ascii_lowercase().replace(' ', "");
+    const UNITS: &[(&str, u64)] = &[
+        ("tib", 1 << 40),
+        ("tb", 1 << 40),
+        ("gib", 1 << 30),
+        ("gb", 1 << 30),
+        ("mib", 1 << 20),
+        ("mb", 1 << 20),
+        ("kib", 1 << 10),
+        ("kb", 1 << 10),
+        ("b", 1),
+    ];
+    for (suffix, factor) in UNITS {
+        if let Some(num) = t.strip_suffix(suffix) {
+            let v: f64 = num
+                .parse()
+                .with_context(|| format!("invalid number in size '{s}'"))?;
+            if v < 0.0 {
+                bail!("size cannot be negative: '{s}'");
+            }
+            return Ok((v * *factor as f64) as u64);
+        }
+    }
+    let v: f64 = t
+        .parse()
+        .with_context(|| format!("unrecognized size '{s}' (try e.g. 10GB, 500MB)"))?;
+    Ok(v as u64)
 }
 
 /// Handle the `app` subcommands.
@@ -480,6 +668,15 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse_rate("fast").is_err());
         assert!(parse_rate("-5mbit").is_err());
+    }
+
+    #[test]
+    fn parses_data_sizes() {
+        assert_eq!(parse_size("10GB").unwrap(), 10 * (1 << 30));
+        assert_eq!(parse_size("500mb").unwrap(), 500 * (1 << 20));
+        assert_eq!(parse_size("2GiB").unwrap(), 2 * (1 << 30));
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert!(parse_size("lots").is_err());
     }
 }
 

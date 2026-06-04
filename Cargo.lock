@@ -156,6 +156,8 @@ dependencies = [
  "clap",
  "curb-proto",
  "libc",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

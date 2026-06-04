@@ -38,6 +38,15 @@ struct AppRuleState {
     down_bps: Option<u64>,
     up_bps: Option<u64>,
     scope: Scope,
+    /// Set by the quota manager when the app's budget is exceeded (P5).
+    blocked: bool,
+}
+
+impl AppRuleState {
+    /// True when this rule has no effect and its entry/cgroup can be dropped.
+    fn is_empty(&self) -> bool {
+        self.down_bps.is_none() && self.up_bps.is_none() && !self.blocked
+    }
 }
 
 struct EngineInner {
@@ -133,6 +142,8 @@ impl Engine {
         cgroup::ensure_app(&dir).context("creating app cgroup")?;
         {
             let mut apps = self.inner.apps.lock().unwrap();
+            // Preserve a quota block if the app is already being tracked.
+            let blocked = apps.get(&exe).map(|r| r.blocked).unwrap_or(false);
             apps.insert(
                 exe.clone(),
                 AppRuleState {
@@ -141,6 +152,7 @@ impl Engine {
                     down_bps,
                     up_bps,
                     scope,
+                    blocked,
                 },
             );
         }
@@ -149,6 +161,92 @@ impl Engine {
         self.inner.reconcile_nft()?;
         reconcile_membership(&self.inner); // place existing processes now
         Ok(self.list_app_limits())
+    }
+
+    /// Begin tracking an app (create its cgroup, place its processes) without
+    /// applying any limit yet. Used by the quota manager so that an exceeded
+    /// budget can immediately block the app's new connections.
+    pub fn ensure_tracked(&self, exe: &str) -> Result<()> {
+        let dir = sanitize_dir(exe);
+        {
+            let mut apps = self.inner.apps.lock().unwrap();
+            if !apps.contains_key(exe) {
+                cgroup::ensure_app(&dir).context("creating app cgroup")?;
+                apps.insert(
+                    exe.to_string(),
+                    AppRuleState {
+                        name: basename(exe),
+                        dir,
+                        down_bps: None,
+                        up_bps: None,
+                        scope: Scope::Both,
+                        blocked: false,
+                    },
+                );
+            }
+        }
+        reconcile_membership(&self.inner);
+        Ok(())
+    }
+
+    /// Drop a tracked app's entry/cgroup if it carries no limit or block.
+    pub fn untrack_if_empty(&self, exe: &str) {
+        let removed = {
+            let mut apps = self.inner.apps.lock().unwrap();
+            match apps.get(exe) {
+                Some(r) if r.is_empty() => apps.remove(exe).map(|r| r.dir),
+                _ => None,
+            }
+        };
+        if let Some(dir) = removed {
+            cgroup::remove_app(&dir);
+        }
+    }
+
+    /// Block or unblock all of an app's traffic (quota enforcement, P5).
+    ///
+    /// Tracks the app (creating its cgroup) if it isn't already; when unblocking
+    /// an app that has no rate caps either, the entry and cgroup are released.
+    pub fn set_app_blocked(&self, exe: &str, blocked: bool) -> Result<()> {
+        let dir = sanitize_dir(exe);
+        let mut removed_dir = None;
+        {
+            let mut apps = self.inner.apps.lock().unwrap();
+            match apps.get_mut(exe) {
+                Some(rule) => {
+                    rule.blocked = blocked;
+                    if rule.is_empty() {
+                        removed_dir = Some(rule.dir.clone());
+                        apps.remove(exe);
+                    }
+                }
+                None if blocked => {
+                    cgroup::ensure_app(&dir).context("creating app cgroup")?;
+                    apps.insert(
+                        exe.to_string(),
+                        AppRuleState {
+                            name: basename(exe),
+                            dir,
+                            down_bps: None,
+                            up_bps: None,
+                            scope: Scope::Both,
+                            blocked: true,
+                        },
+                    );
+                }
+                None => return Ok(()), // unblocking an untracked app: nothing to do
+            }
+        }
+        if blocked {
+            self.inner.state.lock().unwrap().enabled = true;
+        }
+        self.inner.reconcile_nft()?;
+        if let Some(dir) = removed_dir {
+            cgroup::remove_app(&dir);
+        } else {
+            reconcile_membership(&self.inner);
+        }
+        Ok(())
     }
 
     /// Remove a per-application rule and release its cgroup.
@@ -223,6 +321,7 @@ impl EngineInner {
                     down_bps: r.down_bps,
                     up_bps: r.up_bps,
                     scope: r.scope,
+                    blocked: r.blocked,
                 })
                 .collect()
         };

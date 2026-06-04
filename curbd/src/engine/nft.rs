@@ -33,6 +33,9 @@ pub struct AppRule {
     pub up_bps: Option<u64>,
     /// Restrict the rule to LAN, Internet, or both remotes.
     pub scope: Scope,
+    /// When set, drop all of the app's traffic (quota exceeded, P5). Takes
+    /// precedence over the rate caps.
+    pub blocked: bool,
 }
 
 /// Build the address-match clause(s) for a scope+direction, one per IP family.
@@ -79,6 +82,20 @@ pub fn apply(rules: &[AppRule]) -> Result<()> {
     s.push_str("add chain inet curb output { type filter hook output priority -150; }\n");
 
     for r in rules {
+        // Quota exceeded: drop everything for this app, ignore rate caps.
+        if r.blocked {
+            s.push_str(&format!(
+                "add rule inet curb input socket cgroupv2 level {lvl} \"{cg}\" drop\n",
+                lvl = cgroup::APP_LEVEL,
+                cg = r.cgroup_rel,
+            ));
+            s.push_str(&format!(
+                "add rule inet curb output socket cgroupv2 level {lvl} \"{cg}\" drop\n",
+                lvl = cgroup::APP_LEVEL,
+                cg = r.cgroup_rel,
+            ));
+            continue;
+        }
         // Download: police inbound at the input hook; remote is the source.
         if let Some(down) = r.down_bps {
             for clause in scope_clauses(r.scope, "saddr") {

@@ -12,6 +12,7 @@ use std::time::Instant;
 
 mod engine;
 mod monitor;
+mod quota;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -19,6 +20,7 @@ use curb_proto::transport::Connection;
 use curb_proto::{socket_path, DaemonStatus, Request, Response, PROTOCOL_VERSION};
 use engine::Engine;
 use monitor::Monitor;
+use quota::QuotaManager;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -42,6 +44,8 @@ struct State {
     monitor: Option<Monitor>,
     /// Host-wide shaping engine; `None` if no default interface was detected.
     engine: Option<Engine>,
+    /// Per-app quota manager; `Some` only when both monitor and engine exist.
+    quota: Option<QuotaManager>,
 }
 
 impl State {
@@ -104,10 +108,18 @@ async fn main() -> Result<()> {
         }
     };
 
+    // The quota manager needs both live accounting (monitor) and enforcement
+    // (engine); start it only when both are available.
+    let quota = match (&monitor, &engine) {
+        (Some(m), Some(e)) => Some(QuotaManager::start(m.clone(), e.clone())),
+        _ => None,
+    };
+
     let state = Arc::new(State {
         started: Instant::now(),
         monitor,
         engine,
+        quota,
     });
 
     info!(socket = %path.display(), version = env!("CARGO_PKG_VERSION"), "curbd listening");
@@ -241,6 +253,30 @@ fn dispatch(req: Request, state: &State) -> Response {
             Some(e) => Response::AppLimits(e.list_app_limits()),
             None => engine_unavailable(),
         },
+        Request::SetQuota {
+            exe,
+            budget_bytes,
+            period,
+            direction,
+        } => match &state.quota {
+            Some(q) => Response::Quotas(q.set_quota(exe, budget_bytes, period, direction)),
+            None => quota_unavailable(),
+        },
+        Request::ClearQuota { exe } => match &state.quota {
+            Some(q) => Response::Quotas(q.clear_quota(&exe)),
+            None => quota_unavailable(),
+        },
+        Request::ListQuotas => match &state.quota {
+            Some(q) => Response::Quotas(q.list()),
+            None => quota_unavailable(),
+        },
+    }
+}
+
+fn quota_unavailable() -> Response {
+    Response::Error {
+        message: "quotas unavailable (need both the traffic monitor and shaping engine; run as root)"
+            .to_string(),
     }
 }
 

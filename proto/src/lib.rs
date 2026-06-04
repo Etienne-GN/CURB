@@ -70,6 +70,19 @@ pub enum Request {
     ClearAppLimit { exe: String },
     /// List configured per-application rules (P3).
     ListAppLimits,
+    /// Set a data quota for an application (P5). When usage exceeds the budget
+    /// within the period, the app is blocked until the period resets.
+    SetQuota {
+        exe: String,
+        budget_bytes: u64,
+        period: QuotaPeriod,
+        #[serde(default)]
+        direction: Direction,
+    },
+    /// Remove an application's quota (P5).
+    ClearQuota { exe: String },
+    /// List configured quotas with live usage (P5).
+    ListQuotas,
 }
 
 /// The daemon's reply to a [`Request`].
@@ -85,6 +98,8 @@ pub enum Response {
     Limiter(LimiterState),
     /// Reply to per-application limit requests (P3).
     AppLimits(Vec<AppLimit>),
+    /// Reply to quota requests (P5).
+    Quotas(Vec<QuotaStatus>),
     /// Generic success for requests with no payload.
     Ok,
     /// The request could not be served.
@@ -99,6 +114,50 @@ pub struct HostLimit {
     pub down_bps: Option<u64>,
     /// Outbound (upload) cap, bytes/sec; `None` = unlimited.
     pub up_bps: Option<u64>,
+}
+
+/// Traffic direction a quota counts (P5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Direction {
+    /// Count download (inbound) bytes only.
+    Down,
+    /// Count upload (outbound) bytes only.
+    Up,
+    /// Count both directions.
+    #[default]
+    Both,
+}
+
+/// How often a quota's usage counter resets (P5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuotaPeriod {
+    Hourly,
+    Daily,
+    Weekly,
+    Monthly,
+    /// Never resets — a lifetime cap.
+    Total,
+}
+
+/// A configured quota plus its live usage (P5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaStatus {
+    /// Absolute executable path the quota targets.
+    pub exe: String,
+    /// Display name (executable basename).
+    pub name: String,
+    /// Byte budget per period.
+    pub budget_bytes: u64,
+    /// Bytes used in the current period.
+    pub used_bytes: u64,
+    /// Reset period.
+    pub period: QuotaPeriod,
+    /// Direction counted.
+    pub direction: Direction,
+    /// Whether the budget is currently exceeded (app blocked).
+    pub exceeded: bool,
+    /// Seconds until the period resets (`None` for [`QuotaPeriod::Total`]).
+    pub resets_in_secs: Option<u64>,
 }
 
 /// Which traffic a limit applies to, by remote address class (P4).

@@ -170,15 +170,38 @@ fn scope_label(s: Scope) -> &'static str {
 
 #[derive(Subcommand)]
 enum HostCmd {
-    /// Set host-wide caps and enable limiting. Omitting a direction leaves it
-    /// unlimited (this is how you do inbound-only / outbound-only).
-    Limit(HostLimitArgs),
+    /// Set host-wide caps and enable limiting. Each flag is independent; omitted
+    /// flags keep their current value. `--down/--up` cap all host traffic;
+    /// `--lan-*` and `--internet-*` cap those zones separately.
+    Limit(HostScopedArgs),
     /// Disable limiting (keeps configured caps for the next `on`).
     Off,
     /// Re-enable limiting with the previously configured caps.
     On,
     /// Show the current limiter state.
     Show,
+}
+
+#[derive(Args)]
+struct HostScopedArgs {
+    /// Total download cap (all traffic), e.g. `50mbit`, `2MB`.
+    #[arg(long, value_name = "RATE")]
+    down: Option<String>,
+    /// Total upload cap (all traffic).
+    #[arg(long, value_name = "RATE")]
+    up: Option<String>,
+    /// Download cap for LAN (private-address) traffic only.
+    #[arg(long = "lan-down", value_name = "RATE")]
+    lan_down: Option<String>,
+    /// Upload cap for LAN traffic only.
+    #[arg(long = "lan-up", value_name = "RATE")]
+    lan_up: Option<String>,
+    /// Download cap for Internet (public-address) traffic only.
+    #[arg(long = "internet-down", value_name = "RATE")]
+    inet_down: Option<String>,
+    /// Upload cap for Internet traffic only.
+    #[arg(long = "internet-up", value_name = "RATE")]
+    inet_up: Option<String>,
 }
 
 #[derive(Args)]
@@ -439,22 +462,27 @@ fn print_app_limits(limits: &[curb_proto::AppLimit]) {
 async fn run_host(client: &mut Client, cmd: HostCmd) -> Result<()> {
     let req = match &cmd {
         HostCmd::Limit(args) => {
-            let down_bps = args
-                .down
-                .as_deref()
-                .map(parse_rate)
-                .transpose()
-                .context("parsing --down")?;
-            let up_bps = args
-                .up
-                .as_deref()
-                .map(parse_rate)
-                .transpose()
-                .context("parsing --up")?;
-            if down_bps.is_none() && up_bps.is_none() {
-                bail!("specify at least one of --down or --up");
+            // Merge with the current host limit: each provided flag overrides,
+            // omitted flags keep their existing value.
+            let cur = match client.request(&Request::GetLimiter).await? {
+                Response::Limiter(s) => s.host,
+                Response::Error { message } => bail!("daemon error: {message}"),
+                other => bail!("unexpected response: {other:?}"),
+            };
+            let merge = |arg: &Option<String>, current: Option<u64>, what: &str| -> Result<Option<u64>> {
+                match arg {
+                    Some(s) => Ok(Some(parse_rate(s).with_context(|| format!("parsing {what}"))?)),
+                    None => Ok(current),
+                }
+            };
+            Request::SetHostLimit {
+                down_bps: merge(&args.down, cur.down_bps, "--down")?,
+                up_bps: merge(&args.up, cur.up_bps, "--up")?,
+                lan_down_bps: merge(&args.lan_down, cur.lan.down_bps, "--lan-down")?,
+                lan_up_bps: merge(&args.lan_up, cur.lan.up_bps, "--lan-up")?,
+                inet_down_bps: merge(&args.inet_down, cur.internet.down_bps, "--internet-down")?,
+                inet_up_bps: merge(&args.inet_up, cur.internet.up_bps, "--internet-up")?,
             }
-            Request::SetHostLimit { down_bps, up_bps }
         }
         HostCmd::Off => Request::SetLimiterEnabled(false),
         HostCmd::On => Request::SetLimiterEnabled(true),
@@ -471,10 +499,12 @@ async fn run_host(client: &mut Client, cmd: HostCmd) -> Result<()> {
 
 fn print_limiter(s: &LimiterState) {
     let sw = if s.enabled { "ON" } else { "OFF" };
-    let fmt = |c: Option<u64>| c.map(format_rate).unwrap_or_else(|| "unlimited".to_string());
+    let fmt = |c: Option<u64>| c.map(format_rate).unwrap_or_else(|| "—".to_string());
     println!("limiter  : {sw}   (interface {})", s.interface);
-    println!("  ↓ down : {}", fmt(s.host.down_bps));
-    println!("  ↑ up   : {}", fmt(s.host.up_bps));
+    println!("            {:>12}  {:>12}", "↓ down", "↑ up");
+    println!("  total  : {:>12}  {:>12}", fmt(s.host.down_bps), fmt(s.host.up_bps));
+    println!("  lan    : {:>12}  {:>12}", fmt(s.host.lan.down_bps), fmt(s.host.lan.up_bps));
+    println!("  internet:{:>12}  {:>12}", fmt(s.host.internet.down_bps), fmt(s.host.internet.up_bps));
 }
 
 /// Fetch a single live snapshot, mapping protocol errors to anyhow.

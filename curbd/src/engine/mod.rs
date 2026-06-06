@@ -164,11 +164,11 @@ impl Engine {
 
     // ---- Host-wide caps (P2) ----------------------------------------------
 
-    /// Set host-wide caps and enable limiting.
-    pub fn set_host_limit(&self, down_bps: Option<u64>, up_bps: Option<u64>) -> Result<LimiterState> {
+    /// Set host-wide caps (total + LAN/Internet scopes) and enable limiting.
+    pub fn set_host_limit(&self, host: HostLimit) -> Result<LimiterState> {
         {
             let mut st = self.inner.state.lock().unwrap();
-            st.host = HostLimit { down_bps, up_bps };
+            st.host = host;
             st.enabled = true;
         }
         self.inner.reconcile_egress()?;
@@ -367,54 +367,54 @@ impl Engine {
 }
 
 impl EngineInner {
-    /// Rebuild egress (upload) shaping: host default class + per-app classes.
-    ///
-    /// With the eBPF shaper present, per-app uploads are HTB-shaped (the
-    /// classifier steers them by `skb->priority`); without it, only the host
-    /// cap is shaped here and per-app upload is policed by nftables.
+    /// Rebuild egress (upload) shaping: the scoped HTB tree (total → LAN +
+    /// Internet) plus per-app upload classes when the eBPF classifier can steer
+    /// them. Without eBPF, only host shaping is applied here (per-app upload is
+    /// policed by nftables).
     fn reconcile_egress(&self) -> Result<()> {
         let st = self.state.lock().unwrap().clone();
         tc::clear_egress(&self.iface);
-
-        let Some(shaper) = &self.shaper else {
-            // Fallback path: just the host upload cap.
-            if st.enabled {
-                if let Some(up) = st.host.up_bps {
-                    tc::apply_egress(&self.iface, up).context("applying host upload cap")?;
-                }
-            }
-            return Ok(());
-        };
-
-        shaper.clear_all().ok();
+        if let Some(s) = &self.shaper {
+            s.clear_all().ok();
+        }
         if !st.enabled {
             return Ok(());
         }
-        // Root + default class (host cap or line rate); per-app upload classes
-        // steered by the classifier.
-        tc::egress_root(&self.iface, st.host.up_bps).context("building egress HTB root")?;
-        let up_ceil = st.host.up_bps.unwrap_or(tc::LINE_RATE_BPS);
 
-        // Snapshot apps with any rate cap: each gets a shared cgroup->classid
-        // map entry (so egress records its flows for the ingress direction too),
-        // plus an egress class when it has an upload cap.
-        let apps: Vec<(u16, Option<u64>, Option<u64>, String)> = {
+        // Per-app upload classes (steered by the classifier) + the full set of
+        // rate-limited apps that need a cgroup->classid map entry.
+        let (up_apps, mapped): (Vec<(u16, u64)>, Vec<(u16, String)>) = {
             let apps = self.apps.lock().unwrap();
-            apps.values()
+            let up = apps
+                .values()
+                .filter_map(|r| r.up_bps.map(|u| (r.minor, u)))
+                .collect();
+            let mapped = apps
+                .values()
                 .filter(|r| r.up_bps.is_some() || r.down_bps.is_some())
-                .map(|r| (r.minor, r.up_bps, r.down_bps, r.dir.clone()))
-                .collect()
+                .map(|r| (r.minor, r.dir.clone()))
+                .collect();
+            (up, mapped)
         };
-        for (minor, up, _down, dir) in &apps {
-            if let Some(up) = up {
-                tc::egress_app_class(&self.iface, *minor, *up, up_ceil.max(*up))
-                    .context("adding per-app egress class")?;
-            }
-            if let Some(cgid) = cgroup::cgroup_id(dir) {
-                shaper.set_class(cgid, classid(*minor)).ok();
+        let app_classes: &[(u16, u64)] = if self.shaper.is_some() { &up_apps } else { &[] };
+
+        tc::build_egress_tree(
+            &self.iface,
+            st.host.up_bps,
+            st.host.lan.up_bps,
+            st.host.internet.up_bps,
+            app_classes,
+        )
+        .context("building egress HTB tree")?;
+
+        if let Some(shaper) = &self.shaper {
+            for (minor, dir) in &mapped {
+                if let Some(cgid) = cgroup::cgroup_id(dir) {
+                    shaper.set_class(cgid, classid(*minor)).ok();
+                }
             }
         }
-        info!(host_up = ?st.host.up_bps, apps = apps.len(), "egress HTB + eBPF classes applied");
+        info!(host_up = ?st.host.up_bps, "egress scoped HTB applied");
         Ok(())
     }
 
@@ -432,13 +432,21 @@ impl EngineInner {
         let st = self.state.lock().unwrap().clone();
 
         if !(self.shaper.is_some() && self.ebpf_ingress) {
-            // Safe default path.
+            // Safe default path: host download via scoped IFB HTB + mirred.
             tc::clear_ingress(&self.iface, IFB_DEV);
-            if st.enabled {
-                if let Some(down) = st.host.down_bps {
-                    tc::apply_ingress(&self.iface, IFB_DEV, down)
-                        .context("applying host download cap")?;
-                }
+            let any_host_down = st.host.down_bps.is_some()
+                || st.host.lan.down_bps.is_some()
+                || st.host.internet.down_bps.is_some();
+            if st.enabled && any_host_down {
+                tc::build_ingress_scoped(
+                    &self.iface,
+                    IFB_DEV,
+                    st.host.down_bps,
+                    st.host.lan.down_bps,
+                    st.host.internet.down_bps,
+                    &[],
+                )
+                .context("building scoped host download shaping")?;
             }
             return Ok(());
         }

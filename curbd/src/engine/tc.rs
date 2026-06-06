@@ -76,38 +76,122 @@ pub fn default_interface() -> Result<String> {
 /// Effective "unlimited" rate for the default class (~80 Gbit/s in bytes/sec).
 pub const LINE_RATE_BPS: u64 = 10_000_000_000;
 
-/// Build the egress HTB root with a default class (the host upload cap, or
-/// line rate when unlimited). Per-app classes are added under it with
-/// [`egress_app_class`]; the eBPF classifier steers each app's packets into its
-/// class via `skb->priority`. Used for the eBPF shaping path.
-pub fn egress_root(iface: &str, host_up_bps: Option<u64>) -> Result<()> {
+/// IPv4 LAN/private ranges (loopback + RFC1918 + CGNAT + link-local).
+const V4_LAN: &[&str] = &[
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "100.64.0.0/10",
+];
+/// IPv6 LAN/private ranges (loopback + ULA + link-local).
+const V6_LAN: &[&str] = &["::1/128", "fc00::/7", "fe80::/10"];
+
+// HTB class layout under root `1:`:
+//   1:1  total ("all") parent cap
+//   1:2  LAN leaf       (child of 1:1)
+//   1:3  Internet leaf  (child of 1:1, also the qdisc default)
+//   1:10+ per-app leaves (children of 1:1, steered by the eBPF classifier)
+const CLS_TOTAL: &str = "1:1";
+const CLS_LAN: &str = "1:2";
+const CLS_INET: &str = "1:3";
+
+/// Add `u32` filters that send LAN-addressed packets to the LAN class. `field`
+/// is `dst` for egress (remote = destination) or `src` for ingress.
+fn add_lan_filters(dev: &str, field: &str) -> Result<()> {
     let tc = tc_bin();
-    let default_rate = host_up_bps.unwrap_or(LINE_RATE_BPS);
-    let rate = format!("{default_rate}bps");
-    run(&tc, &["qdisc", "add", "dev", iface, "root", "handle", "1:", "htb", "default", "1"])?;
-    run(
-        &tc,
-        &[
-            "class", "add", "dev", iface, "parent", "1:", "classid", "1:1", "htb", "rate", &rate,
-            "ceil", &rate,
-        ],
-    )?;
+    for cidr in V4_LAN {
+        run(&tc, &[
+            "filter", "add", "dev", dev, "parent", "1:", "protocol", "ip", "prio", "1", "u32",
+            "match", "ip", field, cidr, "flowid", CLS_LAN,
+        ])?;
+    }
+    for cidr in V6_LAN {
+        run(&tc, &[
+            "filter", "add", "dev", dev, "parent", "1:", "protocol", "ipv6", "prio", "1", "u32",
+            "match", "ip6", field, cidr, "flowid", CLS_LAN,
+        ])?;
+    }
     Ok(())
 }
 
-/// Add a per-app egress HTB class `1:<minor>` at `rate_bps` (ceil `ceil_bps`).
-pub fn egress_app_class(iface: &str, minor: u16, rate_bps: u64, ceil_bps: u64) -> Result<()> {
+/// Build the scoped HTB tree (total → LAN + Internet + per-app) on a device.
+///
+/// `field` selects the remote-address direction (`dst` egress / `src` ingress).
+/// `apps` is the list of per-app `(class minor, rate)` leaves to create under
+/// the total class (empty when the eBPF classifier isn't steering this device).
+fn build_tree(
+    dev: &str,
+    field: &str,
+    total: Option<u64>,
+    lan: Option<u64>,
+    inet: Option<u64>,
+    apps: &[(u16, u64)],
+) -> Result<()> {
     let tc = tc_bin();
-    let classid = format!("1:{minor:x}");
-    let rate = format!("{rate_bps}bps");
-    let ceil = format!("{ceil_bps}bps");
-    run(
-        &tc,
-        &[
-            "class", "add", "dev", iface, "parent", "1:", "classid", &classid, "htb", "rate",
-            &rate, "ceil", &ceil,
-        ],
-    )?;
+    let total = total.unwrap_or(LINE_RATE_BPS);
+    let rate = |bps: u64| format!("{bps}bps");
+    let ceil = rate(total);
+
+    // default 3 -> unmatched (non-app, non-LAN) traffic goes to the Internet leaf.
+    run(&tc, &["qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "default", "3"])?;
+    run(&tc, &[
+        "class", "add", "dev", dev, "parent", "1:", "classid", CLS_TOTAL, "htb", "rate",
+        &rate(total), "ceil", &ceil,
+    ])?;
+    for (classid, cap) in [(CLS_LAN, lan), (CLS_INET, inet)] {
+        run(&tc, &[
+            "class", "add", "dev", dev, "parent", CLS_TOTAL, "classid", classid, "htb", "rate",
+            &rate(cap.unwrap_or(total)), "ceil", &ceil,
+        ])?;
+    }
+    for (minor, cap) in apps {
+        let classid = format!("1:{minor:x}");
+        run(&tc, &[
+            "class", "add", "dev", dev, "parent", CLS_TOTAL, "classid", &classid, "htb", "rate",
+            &rate(*cap), "ceil", &ceil,
+        ])?;
+    }
+    add_lan_filters(dev, field)
+}
+
+/// Build the scoped egress (upload) HTB tree on the interface.
+pub fn build_egress_tree(
+    iface: &str,
+    total_up: Option<u64>,
+    lan_up: Option<u64>,
+    inet_up: Option<u64>,
+    apps: &[(u16, u64)],
+) -> Result<()> {
+    build_tree(iface, "dst", total_up, lan_up, inet_up, apps)
+}
+
+/// Bring up the IFB device and build the scoped ingress (download) HTB tree,
+/// then redirect the interface's ingress to it with `mirred` (the P2-proven,
+/// reinjection-correct redirect).
+pub fn build_ingress_scoped(
+    iface: &str,
+    ifb: &str,
+    total_down: Option<u64>,
+    lan_down: Option<u64>,
+    inet_down: Option<u64>,
+    apps: &[(u16, u64)],
+) -> Result<()> {
+    let tc = tc_bin();
+    let ip = ip_bin();
+    run_ignore(&ip, &["link", "add", ifb, "type", "ifb"]);
+    run(&ip, &["link", "set", "dev", ifb, "up"])
+        .map_err(|e| anyhow!("bringing up {ifb}: {e}"))?;
+
+    build_tree(ifb, "src", total_down, lan_down, inet_down, apps)?;
+
+    // Redirect the interface's ingress to the IFB device.
+    run(&tc, &["qdisc", "add", "dev", iface, "handle", "ffff:", "ingress"])?;
+    run(&tc, &[
+        "filter", "add", "dev", iface, "parent", "ffff:", "protocol", "all", "u32", "match",
+        "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", ifb,
+    ])?;
     Ok(())
 }
 
@@ -185,55 +269,6 @@ pub fn ifb_clear(ifb: &str) {
     let tc = tc_bin();
     run_ignore(&tc, &["qdisc", "del", "dev", ifb, "root"]);
     run_ignore(&ip_bin(), &["link", "del", ifb]);
-}
-
-/// Apply an egress (upload) rate cap on `iface`.
-pub fn apply_egress(iface: &str, bps: u64) -> Result<()> {
-    let rate = format!("{bps}bps");
-    let tc = tc_bin();
-    run(&tc, &["qdisc", "add", "dev", iface, "root", "handle", "1:", "htb", "default", "1"])?;
-    run(
-        &tc,
-        &[
-            "class", "add", "dev", iface, "parent", "1:", "classid", "1:1", "htb", "rate", &rate,
-            "ceil", &rate,
-        ],
-    )?;
-    Ok(())
-}
-
-/// Apply an ingress (download) rate cap on `iface` via an IFB device.
-pub fn apply_ingress(iface: &str, ifb: &str, bps: u64) -> Result<()> {
-    let rate = format!("{bps}bps");
-    let tc = tc_bin();
-    let ip = ip_bin();
-
-    // Create the IFB device (ignore "exists"), then bring it up.
-    run_ignore(&ip, &["link", "add", ifb, "type", "ifb"]);
-    run(&ip, &["link", "set", "dev", ifb, "up"]).map_err(|e| {
-        anyhow!("bringing up {ifb} (is the ifb kernel module available?): {e}")
-    })?;
-
-    // Ingress qdisc + redirect all packets to the IFB device.
-    run(&tc, &["qdisc", "add", "dev", iface, "handle", "ffff:", "ingress"])?;
-    run(
-        &tc,
-        &[
-            "filter", "add", "dev", iface, "parent", "ffff:", "protocol", "all", "u32", "match",
-            "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", ifb,
-        ],
-    )?;
-
-    // Shape the IFB device's egress (which is iface's redirected ingress).
-    run(&tc, &["qdisc", "add", "dev", ifb, "root", "handle", "1:", "htb", "default", "1"])?;
-    run(
-        &tc,
-        &[
-            "class", "add", "dev", ifb, "parent", "1:", "classid", "1:1", "htb", "rate", &rate,
-            "ceil", &rate,
-        ],
-    )?;
-    Ok(())
 }
 
 /// Remove the egress root qdisc (reverts to the kernel default).

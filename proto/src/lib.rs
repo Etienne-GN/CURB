@@ -45,12 +45,21 @@ pub enum Request {
     GetStatus,
     /// Request the current live per-application traffic snapshot (P1).
     ListApps,
-    /// Set the host-wide rate caps and enable limiting (P2). `None` for a
-    /// direction means "unlimited", which is how inbound-only / outbound-only
-    /// limits are expressed.
+    /// Set the host-wide rate caps and enable limiting (P2/NL-2). `None` for a
+    /// direction means "unlimited". `down_bps`/`up_bps` are the total ("all
+    /// traffic") caps; the `lan_*`/`inet_*` fields cap LAN and Internet traffic
+    /// separately. This replaces the entire host limit (callers merge first).
     SetHostLimit {
         down_bps: Option<u64>,
         up_bps: Option<u64>,
+        #[serde(default)]
+        lan_down_bps: Option<u64>,
+        #[serde(default)]
+        lan_up_bps: Option<u64>,
+        #[serde(default)]
+        inet_down_bps: Option<u64>,
+        #[serde(default)]
+        inet_up_bps: Option<u64>,
     },
     /// Flip the global master switch without changing configured caps (P2).
     SetLimiterEnabled(bool),
@@ -106,14 +115,37 @@ pub enum Response {
     Error { message: String },
 }
 
-/// Host-wide rate caps. `None` in a direction means unlimited (no shaping),
-/// which expresses inbound-only / outbound-only limits.
+/// A directional rate cap pair. `None` means unlimited in that direction.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ScopedCap {
+    /// Inbound (download) cap, bytes/sec.
+    pub down_bps: Option<u64>,
+    /// Outbound (upload) cap, bytes/sec.
+    pub up_bps: Option<u64>,
+}
+
+impl ScopedCap {
+    /// True if neither direction is capped.
+    pub fn is_empty(&self) -> bool {
+        self.down_bps.is_none() && self.up_bps.is_none()
+    }
+}
+
+/// Host-wide rate caps (P2/NL-2). The top-level `down_bps`/`up_bps` apply to all
+/// host traffic; `lan` and `internet` additionally cap those zones separately
+/// (classified by remote address). `None` anywhere means unlimited.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct HostLimit {
-    /// Inbound (download) cap, bytes/sec; `None` = unlimited.
+    /// Total inbound (download) cap across all traffic; `None` = unlimited.
     pub down_bps: Option<u64>,
-    /// Outbound (upload) cap, bytes/sec; `None` = unlimited.
+    /// Total outbound (upload) cap across all traffic; `None` = unlimited.
     pub up_bps: Option<u64>,
+    /// Caps applied only to LAN (private-address) traffic.
+    #[serde(default)]
+    pub lan: ScopedCap,
+    /// Caps applied only to Internet (public-address) traffic.
+    #[serde(default)]
+    pub internet: ScopedCap,
 }
 
 /// Traffic direction a quota counts (P5).

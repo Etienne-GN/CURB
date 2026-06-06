@@ -208,13 +208,34 @@ fn dispatch(req: Request, state: &State) -> Response {
             Some(e) => Response::Limiter(e.state()),
             None => engine_unavailable(),
         },
-        Request::SetHostLimit { down_bps, up_bps } => match &state.engine {
-            Some(e) => match e.set_host_limit(down_bps, up_bps) {
-                Ok(state) => Response::Limiter(state),
-                Err(err) => Response::Error {
-                    message: format!("{err:#}"),
-                },
-            },
+        Request::SetHostLimit {
+            down_bps,
+            up_bps,
+            lan_down_bps,
+            lan_up_bps,
+            inet_down_bps,
+            inet_up_bps,
+        } => match &state.engine {
+            Some(e) => {
+                let host = curb_proto::HostLimit {
+                    down_bps,
+                    up_bps,
+                    lan: curb_proto::ScopedCap {
+                        down_bps: lan_down_bps,
+                        up_bps: lan_up_bps,
+                    },
+                    internet: curb_proto::ScopedCap {
+                        down_bps: inet_down_bps,
+                        up_bps: inet_up_bps,
+                    },
+                };
+                match e.set_host_limit(host) {
+                    Ok(state) => Response::Limiter(state),
+                    Err(err) => Response::Error {
+                        message: format!("{err:#}"),
+                    },
+                }
+            }
             None => engine_unavailable(),
         },
         Request::SetLimiterEnabled(enabled) => match &state.engine {

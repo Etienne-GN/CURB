@@ -101,6 +101,8 @@ const CLS_INET: &str = "1:3";
 /// is `dst` for egress (remote = destination) or `src` for ingress.
 fn add_lan_filters(dev: &str, field: &str) -> Result<()> {
     let tc = tc_bin();
+    // tc filter priorities are unique per parent across protocols, so IPv4 and
+    // IPv6 must use different `prio` values.
     for cidr in V4_LAN {
         run(&tc, &[
             "filter", "add", "dev", dev, "parent", "1:", "protocol", "ip", "prio", "1", "u32",
@@ -109,7 +111,7 @@ fn add_lan_filters(dev: &str, field: &str) -> Result<()> {
     }
     for cidr in V6_LAN {
         run(&tc, &[
-            "filter", "add", "dev", dev, "parent", "1:", "protocol", "ipv6", "prio", "1", "u32",
+            "filter", "add", "dev", dev, "parent", "1:", "protocol", "ipv6", "prio", "2", "u32",
             "match", "ip6", field, cidr, "flowid", CLS_LAN,
         ])?;
     }
@@ -132,25 +134,29 @@ fn build_tree(
     let tc = tc_bin();
     let total = total.unwrap_or(LINE_RATE_BPS);
     let rate = |bps: u64| format!("{bps}bps");
-    let ceil = rate(total);
 
     // default 3 -> unmatched (non-app, non-LAN) traffic goes to the Internet leaf.
     run(&tc, &["qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "default", "3"])?;
+    // Total ("all") parent: rate = ceil = total, so it bounds the aggregate.
     run(&tc, &[
         "class", "add", "dev", dev, "parent", "1:", "classid", CLS_TOTAL, "htb", "rate",
-        &rate(total), "ceil", &ceil,
+        &rate(total), "ceil", &rate(total),
     ])?;
+    // LAN/Internet leaves: a capped leaf is HARD-limited (ceil = its cap, so it
+    // can't borrow above it); an uncapped leaf may use up to the total.
     for (classid, cap) in [(CLS_LAN, lan), (CLS_INET, inet)] {
+        let bound = cap.unwrap_or(total);
         run(&tc, &[
             "class", "add", "dev", dev, "parent", CLS_TOTAL, "classid", classid, "htb", "rate",
-            &rate(cap.unwrap_or(total)), "ceil", &ceil,
+            &rate(bound), "ceil", &rate(bound),
         ])?;
     }
+    // Per-app leaves: ceil = rate = the app's cap (hard per-app limit).
     for (minor, cap) in apps {
         let classid = format!("1:{minor:x}");
         run(&tc, &[
             "class", "add", "dev", dev, "parent", CLS_TOTAL, "classid", &classid, "htb", "rate",
-            &rate(*cap), "ceil", &ceil,
+            &rate(*cap), "ceil", &rate(*cap),
         ])?;
     }
     add_lan_filters(dev, field)
@@ -178,7 +184,6 @@ pub fn build_ingress_scoped(
     inet_down: Option<u64>,
     apps: &[(u16, u64)],
 ) -> Result<()> {
-    let tc = tc_bin();
     let ip = ip_bin();
     run_ignore(&ip, &["link", "add", ifb, "type", "ifb"]);
     run(&ip, &["link", "set", "dev", ifb, "up"])
@@ -186,12 +191,11 @@ pub fn build_ingress_scoped(
 
     build_tree(ifb, "src", total_down, lan_down, inet_down, apps)?;
 
-    // Redirect the interface's ingress to the IFB device.
-    run(&tc, &["qdisc", "add", "dev", iface, "handle", "ffff:", "ingress"])?;
-    run(&tc, &[
-        "filter", "add", "dev", iface, "parent", "ffff:", "protocol", "all", "u32", "match",
-        "u32", "0", "0", "action", "mirred", "egress", "redirect", "dev", ifb,
-    ])?;
+    // Redirect the interface's ingress to the IFB device via the clsact ingress
+    // hook. clsact (also used by the egress eBPF classifier) is mutually
+    // exclusive with the legacy `ingress` qdisc, so we reuse it here.
+    run_ignore(&tc_bin(), &["qdisc", "add", "dev", iface, "clsact"]);
+    add_ingress_redirect(iface, ifb)?;
     Ok(())
 }
 

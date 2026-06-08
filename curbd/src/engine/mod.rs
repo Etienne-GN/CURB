@@ -432,8 +432,10 @@ impl EngineInner {
         let st = self.state.lock().unwrap().clone();
 
         if !(self.shaper.is_some() && self.ebpf_ingress) {
-            // Safe default path: host download via scoped IFB HTB + mirred.
-            tc::clear_ingress(&self.iface, IFB_DEV);
+            // Safe default path: host download via scoped IFB HTB + mirred on
+            // the clsact ingress hook.
+            tc::del_ingress_redirect(&self.iface);
+            tc::ifb_clear(IFB_DEV);
             let any_host_down = st.host.down_bps.is_some()
                 || st.host.lan.down_bps.is_some()
                 || st.host.internet.down_bps.is_some();

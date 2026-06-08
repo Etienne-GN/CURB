@@ -295,13 +295,22 @@ pub struct AppStat {
     pub status: AppStatus,
 }
 
-/// Aggregate host-wide traffic totals.
+/// Aggregate host-wide traffic totals, with a LAN/Internet rate breakdown.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostTotals {
     pub down_bps: u64,
     pub up_bps: u64,
     pub down_total: u64,
     pub up_total: u64,
+    /// Current rates split by remote-address zone (bytes/sec).
+    #[serde(default)]
+    pub lan_down_bps: u64,
+    #[serde(default)]
+    pub lan_up_bps: u64,
+    #[serde(default)]
+    pub inet_down_bps: u64,
+    #[serde(default)]
+    pub inet_up_bps: u64,
 }
 
 /// A complete point-in-time view of live traffic, returned by [`Request::ListApps`].

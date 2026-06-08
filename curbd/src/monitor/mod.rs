@@ -47,20 +47,138 @@ struct AppAccum {
 }
 
 /// All accumulated byte counters, behind one mutex.
+/// A pair of cumulative byte counters plus the previous-sample values (so the
+/// sampler can compute per-second rates).
+#[derive(Default)]
+struct Counter {
+    down: u64,
+    up: u64,
+    last_down: u64,
+    last_up: u64,
+}
+
+impl Counter {
+    /// (down_bps, up_bps) since the last call; advances the cursor.
+    fn rates(&mut self) -> (u64, u64) {
+        let d = self.down - self.last_down;
+        let u = self.up - self.last_up;
+        self.last_down = self.down;
+        self.last_up = self.up;
+        (d, u)
+    }
+}
+
 #[derive(Default)]
 struct Accum {
     /// Keyed by executable path; empty string = unresolved traffic.
     apps: HashMap<String, AppAccum>,
-    host_down: u64,
-    host_up: u64,
-    last_host_down: u64,
-    last_host_up: u64,
+    host: Counter,
+    /// Host traffic split by remote-address zone.
+    lan: Counter,
+    internet: Counter,
+}
+
+/// A network prefix (CIDR) for LAN classification.
+#[derive(Clone, Copy)]
+struct Cidr {
+    net: std::net::IpAddr,
+    prefix: u8,
+}
+
+impl Cidr {
+    fn contains(&self, ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        match (self.net, ip) {
+            (IpAddr::V4(n), IpAddr::V4(a)) => {
+                let mask = if self.prefix == 0 { 0 } else { u32::MAX << (32 - self.prefix.min(32)) };
+                (u32::from(n) & mask) == (u32::from(a) & mask)
+            }
+            (IpAddr::V6(n), IpAddr::V6(a)) => {
+                let mask = if self.prefix == 0 { 0 } else { u128::MAX << (128 - self.prefix.min(128)) };
+                (u128::from(n) & mask) == (u128::from(a) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The set of address ranges treated as "local network": the fixed private
+/// ranges plus the machine's directly-connected subnets (so a LAN peer on a
+/// global IPv6 prefix from your ISP is still LAN, not Internet).
+#[derive(Default)]
+struct LanRanges {
+    subnets: Vec<Cidr>,
+}
+
+impl LanRanges {
+    fn contains(&self, ip: std::net::IpAddr) -> bool {
+        self.subnets.iter().any(|c| c.contains(ip))
+    }
+}
+
+/// Parse a CIDR like `192.168.0.0/24` or a bare address (`::1`).
+fn parse_cidr(s: &str) -> Option<Cidr> {
+    let (net_s, prefix) = match s.split_once('/') {
+        Some((n, p)) => (n, p.parse().ok()?),
+        None => (s, if s.contains(':') { 128 } else { 32 }),
+    };
+    let net: std::net::IpAddr = net_s.parse().ok()?;
+    Some(Cidr { net, prefix })
+}
+
+/// Locate the `ip` binary (daemons may have a minimal PATH).
+fn ip_bin() -> String {
+    for p in ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"] {
+        if std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+    "ip".to_string()
+}
+
+/// Build the LAN range set: static private ranges + directly-connected subnets
+/// from the routing table (routes without a `via` next hop are on-link = LAN).
+fn load_lan_ranges() -> LanRanges {
+    let mut subnets: Vec<Cidr> = [
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "100.64.0.0/10",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+    .iter()
+    .filter_map(|s| parse_cidr(s))
+    .collect();
+
+    let ip = ip_bin();
+    for args in [["route", "show"].as_slice(), ["-6", "route", "show"].as_slice()] {
+        if let Ok(out) = std::process::Command::new(&ip).args(args).output() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let mut toks = line.split_whitespace();
+                let Some(first) = toks.next() else { continue };
+                // Skip the default route and any routed (off-link) prefix.
+                if first == "default" || line.contains(" via ") {
+                    continue;
+                }
+                if let Some(cidr) = parse_cidr(first) {
+                    subnets.push(cidr);
+                }
+            }
+        }
+    }
+    LanRanges { subnets }
 }
 
 struct Inner {
     procmap: RwLock<Arc<ProcMap>>,
     accum: Mutex<Accum>,
     snapshot: RwLock<MonitorSnapshot>,
+    /// LAN address ranges (refreshed with the proc map).
+    lan: RwLock<Arc<LanRanges>>,
 }
 
 /// Handle to the running monitor. Cloneable; threads keep it alive.
@@ -79,6 +197,7 @@ impl Monitor {
             procmap: RwLock::new(Arc::new(ProcMap::build())),
             accum: Mutex::new(Accum::default()),
             snapshot: RwLock::new(MonitorSnapshot::default()),
+            lan: RwLock::new(Arc::new(load_lan_ranges())),
         });
 
         // Capture thread.
@@ -95,8 +214,8 @@ impl Monitor {
                 .name("curb-procmap".into())
                 .spawn(move || loop {
                     std::thread::sleep(REFRESH_INTERVAL);
-                    let fresh = Arc::new(ProcMap::build());
-                    *inner.procmap.write().unwrap() = fresh;
+                    *inner.procmap.write().unwrap() = Arc::new(ProcMap::build());
+                    *inner.lan.write().unwrap() = Arc::new(load_lan_ranges());
                 })?;
         }
         // Sampler.
@@ -162,6 +281,7 @@ fn capture_loop(socket: std::os::fd::OwnedFd, inner: Arc<Inner>) {
             None => flow_cache.get(&key).cloned().unwrap_or_default(),
         };
 
+        let is_lan = inner.lan.read().unwrap().contains(s.rem_ip);
         let mut acc = inner.accum.lock().unwrap();
         {
             let app = acc.apps.entry(exe).or_default();
@@ -171,10 +291,20 @@ fn capture_loop(socket: std::os::fd::OwnedFd, inner: Arc<Inner>) {
                 app.down_total += s.bytes;
             }
         }
-        if s.outgoing {
-            acc.host_up += s.bytes;
+        let zone = if is_lan {
+            &mut acc.lan
         } else {
-            acc.host_down += s.bytes;
+            &mut acc.internet
+        };
+        if s.outgoing {
+            zone.up += s.bytes;
+        } else {
+            zone.down += s.bytes;
+        }
+        if s.outgoing {
+            acc.host.up += s.bytes;
+        } else {
+            acc.host.down += s.bytes;
         }
     }
 }
@@ -228,14 +358,19 @@ impl Inner {
             acc.apps.remove(&k);
         }
 
+        let (host_down_bps, host_up_bps) = acc.host.rates();
+        let (lan_down_bps, lan_up_bps) = acc.lan.rates();
+        let (inet_down_bps, inet_up_bps) = acc.internet.rates();
         let host = HostTotals {
-            down_bps: acc.host_down - acc.last_host_down,
-            up_bps: acc.host_up - acc.last_host_up,
-            down_total: acc.host_down,
-            up_total: acc.host_up,
+            down_bps: host_down_bps,
+            up_bps: host_up_bps,
+            down_total: acc.host.down,
+            up_total: acc.host.up,
+            lan_down_bps,
+            lan_up_bps,
+            inet_down_bps,
+            inet_up_bps,
         };
-        acc.last_host_down = acc.host_down;
-        acc.last_host_up = acc.host_up;
         drop(acc);
 
         // Busiest first.

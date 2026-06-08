@@ -96,12 +96,28 @@ async fn list_quotas() -> Result<Vec<QuotaStatus>, String> {
 // ---- Mutating commands ----------------------------------------------------
 
 /// Set host-wide caps (bytes/sec; `null` = unlimited) and enable limiting.
+/// `down_bps`/`up_bps` are the total caps; the `lan_*`/`inet_*` args cap those
+/// zones separately. Omitted (None) args are passed through as-is, so the
+/// frontend sends the full desired host limit each time.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn set_host_limit(
     down_bps: Option<u64>,
     up_bps: Option<u64>,
+    lan_down_bps: Option<u64>,
+    lan_up_bps: Option<u64>,
+    inet_down_bps: Option<u64>,
+    inet_up_bps: Option<u64>,
 ) -> Result<LimiterState, String> {
-    match call(Request::SetHostLimit { down_bps, up_bps }).await? {
+    let req = Request::SetHostLimit {
+        down_bps,
+        up_bps,
+        lan_down_bps,
+        lan_up_bps,
+        inet_down_bps,
+        inet_up_bps,
+    };
+    match call(req).await? {
         Response::Limiter(s) => Ok(s),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),

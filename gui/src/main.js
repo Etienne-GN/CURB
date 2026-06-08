@@ -1,19 +1,32 @@
 const { invoke } = window.__TAURI__.core;
 
+// --- Constants ---
+const PRESETS = [
+    null,
+    256000 / 8, 512000 / 8,
+    1000000 / 8, 2000000 / 8, 5000000 / 8,
+    10000000 / 8, 20000000 / 8, 50000000 / 8,
+    100000000 / 8, 200000000 / 8, 500000000 / 8,
+    1000000000 / 8
+];
+
 // --- State ---
 let apps = [];
 let hostTotals = { down_bps: 0, up_bps: 0, down_total: 0, up_total: 0 };
-let limiterState = { enabled: false, host: { down_bps: null, up_bps: null }, interface: "" };
+let limiterState = { enabled: false, host: { down_bps: null, up_bps: null, lan: { down_bps: null, up_bps: null }, internet: { down_bps: null, up_bps: null } }, interface: "" };
 let appLimits = [];
 let quotas = [];
 let selectedExe = null;
 let searchQuery = "";
 let hostDownHistory = Array(60).fill(0);
 let hostUpHistory = Array(60).fill(0);
+let expandedNodes = new Set(['host']); // host expanded by default
+let currentView = 'Applications';
 
 // --- Helpers ---
 
 function formatRate(bps) {
+    if (bps === null || bps === undefined) return "—";
     const bits = bps * 8;
     if (bits >= 1000000000) return (bits / 1000000000).toFixed(1) + " Gbit";
     if (bits >= 1000000) return (bits / 1000000).toFixed(1) + " Mbit";
@@ -29,7 +42,7 @@ function formatSize(bytes) {
 }
 
 function parseRate(input) {
-    if (!input) return null;
+    if (!input || input === "—" || input === "unlimited" || input === "0") return null;
     const match = input.toLowerCase().match(/^([\d\.]+)\s*(gbit|mbit|kbit|bit|gb|mb|kb|b)?$/);
     if (!match) return null;
     const val = parseFloat(match[1]);
@@ -132,6 +145,67 @@ async function poll() {
     }
 }
 
+// --- UI Components ---
+
+function createSpinner(value, onUpdate) {
+    const container = document.createElement('div');
+    container.className = 'spinner-control';
+    
+    const valDisplay = document.createElement('div');
+    valDisplay.className = 'spinner-value';
+    valDisplay.textContent = formatRate(value);
+    
+    const btns = document.createElement('div');
+    btns.className = 'spinner-btns';
+    
+    const upBtn = document.createElement('div');
+    upBtn.className = 'spinner-btn';
+    upBtn.textContent = '▲';
+    upBtn.onclick = (e) => {
+        e.stopPropagation();
+        const currentIdx = PRESETS.findIndex(p => p !== null && p >= value);
+        const next = currentIdx === -1 ? PRESETS[1] : PRESETS[Math.min(currentIdx + (value === PRESETS[currentIdx] ? 1 : 0), PRESETS.length - 1)];
+        onUpdate(next);
+    };
+    
+    const downBtn = document.createElement('div');
+    downBtn.className = 'spinner-btn';
+    downBtn.textContent = '▼';
+    downBtn.onclick = (e) => {
+        e.stopPropagation();
+        const currentIdx = PRESETS.findIndex(p => p !== null && p >= value);
+        const next = currentIdx <= 1 ? null : PRESETS[currentIdx - 1];
+        onUpdate(next);
+    };
+
+    valDisplay.onclick = (e) => {
+        e.stopPropagation();
+        const input = document.createElement('input');
+        input.className = 'spinner-input';
+        input.value = value ? formatRate(value).replace(/\s/g, '').toLowerCase() : "";
+        input.onkeydown = (ev) => {
+            if (ev.key === 'Enter') {
+                onUpdate(parseRate(input.value));
+                container.removeChild(input);
+            } else if (ev.key === 'Escape') {
+                container.removeChild(input);
+            }
+        };
+        input.onblur = () => {
+            if (container.contains(input)) container.removeChild(input);
+        };
+        container.appendChild(input);
+        input.focus();
+    };
+
+    btns.appendChild(upBtn);
+    btns.appendChild(downBtn);
+    container.appendChild(valDisplay);
+    container.appendChild(btns);
+    
+    return container;
+}
+
 // --- UI Rendering ---
 
 function renderUI() {
@@ -151,60 +225,171 @@ function renderTopBar() {
     createSparkline(document.getElementById('global-down-spark'), hostDownHistory, "var(--download)", 60, 20);
     createSparkline(document.getElementById('global-up-spark'), hostUpHistory, "var(--upload)", 60, 20);
 
-    const hostLimitText = document.getElementById('host-limit-text');
-    const downLim = limiterState.host.down_bps ? formatRate(limiterState.host.down_bps) : "∞";
-    const upLim = limiterState.host.up_bps ? formatRate(limiterState.host.up_bps) : "∞";
-    hostLimitText.textContent = `↓ ${downLim} / ↑ ${upLim}`;
-
     document.getElementById('interface-name').textContent = limiterState.interface || "";
+}
+
+function toggleNode(id) {
+    if (expandedNodes.has(id)) expandedNodes.delete(id);
+    else expandedNodes.add(id);
+    renderTable();
 }
 
 function renderTable() {
     const tbody = document.getElementById('apps-body');
-    const filteredApps = apps.filter(app => {
-        if (!app.exe) return false; // Skip unresolved for now or handle them later
-        if (!searchQuery) return true;
-        return app.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
-               app.exe.toLowerCase().includes(searchQuery.toLowerCase());
-    });
+    tbody.innerHTML = "";
 
-    // If no app selected, pick first
-    if (!selectedExe && filteredApps.length > 0) {
-        selectedExe = filteredApps[0].exe;
+    // Tabs other than the main monitor show a placeholder for now.
+    if (currentView !== 'Applications' && currentView !== 'Dashboard') {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td colspan="8" class="view-placeholder">${currentView} — coming soon.<br>
+            <span>Use the Applications tab for live monitoring and limits.</span></td>`;
+        tbody.appendChild(tr);
+        return;
     }
 
-    tbody.innerHTML = "";
-    filteredApps.forEach(app => {
-        const limit = appLimits.find(l => l.exe === app.exe);
-        const quota = quotas.find(q => q.exe === app.exe);
+    // ONE tree rooted at "This computer". Children: the Local Network and
+    // Internet host zones, then every application — all nested under the host.
+    renderHostRoot(tbody);
+    if (expandedNodes.has('host')) {
+        renderHostRow(tbody, 'Local Network', limiterState.host.lan.down_bps, limiterState.host.lan.up_bps, 1, 'lan');
+        renderHostRow(tbody, 'Internet', limiterState.host.internet.down_bps, limiterState.host.internet.up_bps, 1, 'internet');
 
-        let status = "Watching";
-        let statusClass = "pill-muted";
-        if (quota && quota.exceeded) {
-            status = "Throttled";
-            statusClass = "pill-rose";
-        } else if (limit) {
-            status = "Limited";
-            statusClass = "pill-emerald";
-        }
+        const filteredApps = apps.filter(app => {
+            if (!app.exe) return false;
+            if (!searchQuery) return true;
+            return app.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                   app.exe.toLowerCase().includes(searchQuery.toLowerCase());
+        });
+        filteredApps.forEach(app => renderAppRow(tbody, app, 1));
+    }
+}
 
-        const tr = document.createElement('tr');
-        if (app.exe === selectedExe) tr.classList.add('selected');
-        
-        tr.onclick = () => {
-            selectedExe = app.exe;
-            renderUI();
-        };
+// The host root row: disclosure toggle + total host rate + total limit spinners.
+function renderHostRoot(tbody) {
+    const isExpanded = expandedNodes.has('host');
+    const tr = document.createElement('tr');
+    tr.className = 'tree-row tree-root';
+    tr.innerHTML = `
+        <td>
+            <div class="tree-indent" style="--level: 0">
+                <div class="tree-toggle">${isExpanded ? '▼' : '▶'}</div>
+                <span style="font-weight: 700;">This computer</span>
+            </div>
+        </td>
+        <td></td>
+        <td><span class="download-text">${formatRate(hostTotals.down_bps)}</span></td>
+        <td><span class="upload-text">${formatRate(hostTotals.up_bps)}</span></td>
+        <td class="td-down-lim"></td>
+        <td class="td-up-lim"></td>
+        <td></td>
+        <td></td>
+    `;
+    const toggle = () => toggleNode('host');
+    tr.querySelector('.tree-toggle').onclick = (e) => { e.stopPropagation(); toggle(); };
+    tr.querySelector('.tree-indent > span').onclick = (e) => { e.stopPropagation(); toggle(); };
+    tr.querySelector('.td-down-lim').appendChild(
+        createSpinner(limiterState.host.down_bps, (v) => setHostLimit('host', 'down', v)));
+    tr.querySelector('.td-up-lim').appendChild(
+        createSpinner(limiterState.host.up_bps, (v) => setHostLimit('host', 'up', v)));
+    tbody.appendChild(tr);
+}
 
-        const downLimStr = limit && limit.down_bps ? formatRate(limit.down_bps) : "—";
-        const upLimStr = limit && limit.up_bps ? formatRate(limit.up_bps) : "—";
-        const scope = limit ? limit.scope : "Both";
+function renderTreeGroup(tbody, id, label, level) {
+    const tr = document.createElement('tr');
+    tr.className = 'tree-group-header';
+    const isExpanded = expandedNodes.has(id);
+    
+    tr.innerHTML = `
+        <td colspan="8">
+            <div class="tree-indent" style="--level: ${level}">
+                <div class="tree-toggle">${isExpanded ? '▼' : '▶'}</div>
+                <span>${label}</span>
+            </div>
+        </td>
+    `;
+    tr.onclick = () => {
+        if (isExpanded) expandedNodes.delete(id);
+        else expandedNodes.add(id);
+        renderTable();
+    };
+    tbody.appendChild(tr);
+}
 
-        const quotaPercent = quota ? Math.min((quota.used_bytes / quota.budget_bytes) * 100, 100) : 0;
-        const quotaExceeded = quota ? quota.exceeded : false;
+function renderHostRow(tbody, label, downLim, upLim, level, type) {
+    const tr = document.createElement('tr');
+    tr.className = 'tree-row';
+    
+    // Live rate for the zone rows, split by LAN vs Internet.
+    let downRate = "—", upRate = "—";
+    if (type === 'lan') {
+        downRate = formatRate(hostTotals.lan_down_bps || 0);
+        upRate = formatRate(hostTotals.lan_up_bps || 0);
+    } else if (type === 'internet') {
+        downRate = formatRate(hostTotals.inet_down_bps || 0);
+        upRate = formatRate(hostTotals.inet_up_bps || 0);
+    } else if (type === 'host') {
+        downRate = formatRate(hostTotals.down_bps);
+        upRate = formatRate(hostTotals.up_bps);
+    }
 
-        tr.innerHTML = `
-            <td>
+    tr.innerHTML = `
+        <td>
+            <div class="tree-indent" style="--level: ${level}">
+                <div class="tree-guide" style="--level: ${level}"></div>
+                <span style="font-weight: 600;">${label}</span>
+            </div>
+        </td>
+        <td></td>
+        <td><span class="download-text">${downRate}</span></td>
+        <td><span class="upload-text">${upRate}</span></td>
+        <td class="td-down-lim"></td>
+        <td class="td-up-lim"></td>
+        <td></td>
+        <td></td>
+    `;
+
+    const downSpinner = createSpinner(downLim, (val) => setHostLimit(type, 'down', val));
+    const upSpinner = createSpinner(upLim, (val) => setHostLimit(type, 'up', val));
+    
+    tr.querySelector('.td-down-lim').appendChild(downSpinner);
+    tr.querySelector('.td-up-lim').appendChild(upSpinner);
+
+    tbody.appendChild(tr);
+}
+
+function renderAppRow(tbody, app, level) {
+    const limit = appLimits.find(l => l.exe === app.exe);
+    const quota = quotas.find(q => q.exe === app.exe);
+
+    let status = "Watching";
+    let statusClass = "pill-muted";
+    if (quota && quota.exceeded) {
+        status = "Throttled";
+        statusClass = "pill-rose";
+    } else if (limit) {
+        status = "Limited";
+        statusClass = "pill-emerald";
+    }
+
+    const tr = document.createElement('tr');
+    tr.className = 'tree-row';
+    if (app.exe === selectedExe) tr.classList.add('selected');
+    
+    tr.onclick = () => {
+        selectedExe = app.exe;
+        renderDetailStrip(); // Just update detail strip, don't re-render whole table to preserve inputs
+        document.querySelectorAll('#apps-body tr').forEach(r => r.classList.remove('selected'));
+        tr.classList.add('selected');
+    };
+
+    const scope = limit ? limit.scope : "Both";
+    const quotaPercent = quota ? Math.min((quota.used_bytes / quota.budget_bytes) * 100, 100) : 0;
+    const quotaExceeded = quota ? quota.exceeded : false;
+
+    tr.innerHTML = `
+        <td>
+            <div class="tree-indent" style="--level: ${level}">
+                <div class="tree-guide" style="--level: ${level}"></div>
                 <div class="app-cell">
                     <div class="app-icon" style="border-top: 2px solid #34d399">${app.name[0].toUpperCase()}</div>
                     <div class="app-info">
@@ -212,44 +397,47 @@ function renderTable() {
                         <span class="app-path">${app.exe}</span>
                     </div>
                 </div>
-            </td>
-            <td><span class="pill ${statusClass}">${status}</span></td>
-            <td>
-                <div class="rate-cell">
-                    <span class="download-text">${formatRate(app.down_bps)}</span>
-                    <svg class="inline-spark" id="spark-down-${app.exe.replace(/\//g, '_')}"></svg>
+            </div>
+        </td>
+        <td><span class="pill ${statusClass}">${status}</span></td>
+        <td>
+            <div class="rate-cell">
+                <span class="download-text">${formatRate(app.down_bps)}</span>
+                <svg class="inline-spark" id="spark-down-${app.exe.replace(/\//g, '_')}"></svg>
+            </div>
+        </td>
+        <td>
+            <div class="rate-cell">
+                <span class="upload-text">${formatRate(app.up_bps)}</span>
+                <svg class="inline-spark" id="spark-up-${app.exe.replace(/\//g, '_')}"></svg>
+            </div>
+        </td>
+        <td class="td-down-lim"></td>
+        <td class="td-up-lim"></td>
+        <td><span class="pill pill-${scope.toLowerCase()} scope-pill" style="cursor: pointer;">${scope}</span></td>
+        <td>
+            <div class="quota-container">
+                <div class="quota-bar-bg">
+                    <div class="quota-bar-fill ${quotaExceeded ? 'danger' : ''}" style="width: ${quotaPercent}%"></div>
                 </div>
-            </td>
-            <td>
-                <div class="rate-cell">
-                    <span class="upload-text">${formatRate(app.up_bps)}</span>
-                    <svg class="inline-spark" id="spark-up-${app.exe.replace(/\//g, '_')}"></svg>
-                </div>
-            </td>
-            <td><div class="limit-chip" data-dir="down">${downLimStr}</div></td>
-            <td><div class="limit-chip" data-dir="up">${upLimStr}</div></td>
-            <td><span class="pill pill-${scope.toLowerCase()} scope-pill" style="cursor: pointer;">${scope}</span></td>
-            <td>
-                <div class="quota-container">
-                    <div class="quota-bar-bg">
-                        <div class="quota-bar-fill ${quotaExceeded ? 'danger' : ''}" style="width: ${quotaPercent}%"></div>
-                    </div>
-                    <span class="quota-label">${quota ? formatSize(quota.used_bytes) + ' / ' + formatSize(quota.budget_bytes) : '—'}</span>
-                </div>
-            </td>
-        `;
+                <span class="quota-label">${quota ? formatSize(quota.used_bytes) + ' / ' + formatSize(quota.budget_bytes) : '—'}</span>
+            </div>
+        </td>
+    `;
 
-        // Click handlers for the specific chips
-        tr.querySelector('[data-dir="down"]').onclick = (e) => { e.stopPropagation(); promptAppLimit(app.exe, 'down'); };
-        tr.querySelector('[data-dir="up"]').onclick = (e) => { e.stopPropagation(); promptAppLimit(app.exe, 'up'); };
-        tr.querySelector('.scope-pill').onclick = (e) => { e.stopPropagation(); cycleScope(app.exe); };
-        tr.querySelector('.quota-container').onclick = (e) => { e.stopPropagation(); promptQuota(app.exe); };
+    const downSpinner = createSpinner(limit ? limit.down_bps : null, (val) => setAppLimit(app.exe, 'down', val));
+    const upSpinner = createSpinner(limit ? limit.up_bps : null, (val) => setAppLimit(app.exe, 'up', val));
+    
+    tr.querySelector('.td-down-lim').appendChild(downSpinner);
+    tr.querySelector('.td-up-lim').appendChild(upSpinner);
 
-        tbody.appendChild(tr);
+    tr.querySelector('.scope-pill').onclick = (e) => { e.stopPropagation(); cycleScope(app.exe); };
+    tr.querySelector('.quota-container').onclick = (e) => { e.stopPropagation(); promptQuota(app.exe); };
 
-        createSparkline(document.getElementById(`spark-down-${app.exe.replace(/\//g, '_')}`), app.down_spark, "var(--download)");
-        createSparkline(document.getElementById(`spark-up-${app.exe.replace(/\//g, '_')}`), app.up_spark, "var(--upload)");
-    });
+    tbody.appendChild(tr);
+
+    createSparkline(document.getElementById(`spark-down-${app.exe.replace(/\//g, '_')}`), app.down_spark, "var(--download)");
+    createSparkline(document.getElementById(`spark-up-${app.exe.replace(/\//g, '_')}`), app.up_spark, "var(--upload)");
 }
 
 function renderDetailStrip() {
@@ -302,36 +490,42 @@ async function toggleMasterLimiter() {
     } catch (err) { alert(err); }
 }
 
-async function promptHostLimit() {
-    const down = prompt("Host Download Limit (e.g. 100mbit, 10mb, or leave empty for unlimited):", 
-        limiterState.host.down_bps ? formatRate(limiterState.host.down_bps) : "");
-    const up = prompt("Host Upload Limit (e.g. 20mbit, 2mb, or leave empty for unlimited):", 
-        limiterState.host.up_bps ? formatRate(limiterState.host.up_bps) : "");
-    
+async function setHostLimit(type, dir, val) {
+    const h = limiterState.host;
+    let params = {
+        downBps: h.down_bps,
+        upBps: h.up_bps,
+        lanDownBps: h.lan.down_bps,
+        lanUpBps: h.lan.up_bps,
+        inetDownBps: h.internet.down_bps,
+        inetUpBps: h.internet.up_bps
+    };
+
+    if (type === 'host') {
+        if (dir === 'down') params.downBps = val;
+        else params.upBps = val;
+    } else if (type === 'lan') {
+        if (dir === 'down') params.lanDownBps = val;
+        else params.lanUpBps = val;
+    } else if (type === 'internet') {
+        if (dir === 'down') params.inetDownBps = val;
+        else params.inetUpBps = val;
+    }
+
     try {
-        await invoke('set_host_limit', { 
-            downBps: down === null ? undefined : parseRate(down), 
-            upBps: up === null ? undefined : parseRate(up) 
-        });
+        await invoke('set_host_limit', params);
         poll();
     } catch (err) { alert(err); }
 }
 
-async function promptAppLimit(exe, dir) {
+async function setAppLimit(exe, dir, val) {
     const limit = appLimits.find(l => l.exe === exe);
-    const currentVal = limit ? (dir === 'down' ? limit.down_bps : limit.up_bps) : null;
-    const input = prompt(`${dir.toUpperCase()} limit for ${exe} (e.g. 5mbit, 1mb, or empty to clear):`, 
-        currentVal ? formatRate(currentVal) : "");
-    
-    if (input === null) return;
-    
-    const newVal = parseRate(input);
     let downBps = limit ? limit.down_bps : null;
     let upBps = limit ? limit.up_bps : null;
     let scope = limit ? limit.scope.toLowerCase() : 'both';
 
-    if (dir === 'down') downBps = newVal;
-    else upBps = newVal;
+    if (dir === 'down') downBps = val;
+    else upBps = val;
 
     try {
         if (downBps === null && upBps === null && (!quotas.find(q => q.exe === exe))) {
@@ -393,12 +587,23 @@ async function promptQuota(exe) {
 
 // --- Init ---
 
-document.getElementById('master-limiter-toggle').onclick = toggleMasterLimiter;
-document.getElementById('host-limit-toggle').onclick = promptHostLimit;
-document.getElementById('search-apps').oninput = (e) => {
-    searchQuery = e.target.value;
-    renderTable();
-};
+// Wire the top-bar master switch and search (null-safe so one missing element
+// never halts the rest of the script).
+const masterToggle = document.getElementById('master-limiter-toggle');
+if (masterToggle) masterToggle.onclick = toggleMasterLimiter;
+const searchBox = document.getElementById('search-apps');
+if (searchBox) searchBox.oninput = (e) => { searchQuery = e.target.value; renderTable(); };
+
+// Wire the sidebar tabs: switch the active item and the current view.
+document.querySelectorAll('.nav-item').forEach((item) => {
+    item.onclick = (e) => {
+        e.preventDefault();
+        currentView = item.textContent.trim();
+        document.querySelectorAll('.nav-item').forEach((n) => n.classList.remove('active'));
+        item.classList.add('active');
+        renderTable();
+    };
+});
 
 // Start polling
 poll();

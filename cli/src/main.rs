@@ -554,6 +554,7 @@ fn render_table(snap: &MonitorSnapshot, max_rows: usize) -> String {
         up_bps,
         down_total,
         up_total,
+        ..
     } = snap.host;
 
     let _ = writeln!(

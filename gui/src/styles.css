@@ -363,6 +363,122 @@ tr.selected {
     opacity: 0.6;
 }
 
+/* Tree View */
+.tree-row {
+    position: relative;
+}
+
+.tree-indent {
+    display: flex;
+    align-items: center;
+    padding-left: calc(var(--level, 0) * 20px);
+}
+
+.tree-guide {
+    position: absolute;
+    left: calc(var(--level, 0) * 20px - 10px);
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background-color: var(--border);
+}
+
+.tree-toggle {
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--text-muted);
+    user-select: none;
+    font-size: 10px;
+}
+
+.tree-toggle:hover {
+    color: var(--text-primary);
+}
+
+.tree-group-header {
+    background-color: rgba(255, 255, 255, 0.02);
+    font-weight: 600;
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* Spinner Control */
+.spinner-control {
+    display: flex;
+    align-items: center;
+    background-color: var(--elevated);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 4px;
+    gap: 4px;
+    min-width: 85px;
+    height: 26px;
+    position: relative;
+}
+
+.spinner-value {
+    flex-grow: 1;
+    font-family: "Courier New", Courier, monospace;
+    font-variant-numeric: tabular-nums;
+    cursor: text;
+    text-align: right;
+    padding-right: 4px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.spinner-btns {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.spinner-btn {
+    width: 14px;
+    height: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: var(--border);
+    color: var(--text-muted);
+    border-radius: 2px;
+    font-size: 8px;
+    cursor: pointer;
+    line-height: 1;
+}
+
+.spinner-btn:hover {
+    background-color: var(--text-muted);
+    color: var(--surface);
+}
+
+.spinner-input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    background-color: var(--app-bg);
+    border: 1px solid var(--brand);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 0 4px;
+    text-align: right;
+    outline: none;
+}
+
+.applying {
+    opacity: 0.6;
+    pointer-events: none;
+}
+
 /* Quota Bar */
 .quota-container {
     display: flex;
@@ -467,3 +583,19 @@ polyline {
     stroke: none;
     opacity: 0.1;
 }
+
+/* Placeholder shown for tabs other than Applications/Dashboard */
+.view-placeholder {
+    text-align: center;
+    padding: 80px 20px;
+    color: var(--text-muted);
+    font-size: 16px;
+}
+.view-placeholder span {
+    display: block;
+    margin-top: 8px;
+    font-size: 12px;
+    opacity: 0.7;
+}
+/* Host root row emphasis */
+.tree-root td { background: rgba(255,255,255,0.015); }

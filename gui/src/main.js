@@ -20,18 +20,17 @@ let selectedExe = null;
 let searchQuery = "";
 let hostDownHistory = Array(60).fill(0);
 let hostUpHistory = Array(60).fill(0);
-let expandedNodes = new Set(['host']); // host expanded by default
-let currentView = 'Applications';
+let expandedNodes = new Set(['host', 'lan', 'internet']); // all expanded by default
+let currentView = 'Dashboard';
 
 // --- Helpers ---
 
 function formatRate(bps) {
     if (bps === null || bps === undefined) return "—";
-    const bits = bps * 8;
-    if (bits >= 1000000000) return (bits / 1000000000).toFixed(1) + " Gbit";
-    if (bits >= 1000000) return (bits / 1000000).toFixed(1) + " Mbit";
-    if (bits >= 1000) return (bits / 1000).toFixed(1) + " Kbit";
-    return bits.toFixed(0) + " bit";
+    if (bps >= 1e9) return (bps / 1e9).toFixed(2) + " GB/s";
+    if (bps >= 1e6) return (bps / 1e6).toFixed(2) + " MB/s";
+    if (bps >= 1e3) return (bps / 1e3).toFixed(1) + " KB/s";
+    return bps.toFixed(0) + " B/s";
 }
 
 function formatSize(bytes) {
@@ -210,8 +209,84 @@ function createSpinner(value, onUpdate) {
 
 function renderUI() {
     renderTopBar();
-    renderTable();
+    if (!popupOpen) {
+        if (currentView === 'Dashboard') {
+            document.getElementById('table-container').style.display = 'none';
+            document.getElementById('dashboard-view').style.display  = 'flex';
+            renderDashboard();
+        } else {
+            document.getElementById('table-container').style.display = '';
+            document.getElementById('dashboard-view').style.display  = 'none';
+            renderTable();
+        }
+    }
     renderDetailStrip();
+}
+
+function renderDashboard() {
+    const dash = document.getElementById('dashboard-view');
+    const topApps = [...apps]
+        .sort((a, b) => (b.down_bps + b.up_bps) - (a.down_bps + a.up_bps))
+        .slice(0, 6);
+
+    dash.innerHTML = `
+        <div class="dash-row">
+            <div class="dash-card">
+                <div class="dash-label">↓ Download</div>
+                <div class="dash-big download-text">${formatRate(hostTotals.down_bps)}</div>
+                <svg class="dash-spark" id="dsp-down"></svg>
+                <div class="dash-sub">${formatSize(hostTotals.down_total)} total since start</div>
+            </div>
+            <div class="dash-card">
+                <div class="dash-label">↑ Upload</div>
+                <div class="dash-big upload-text">${formatRate(hostTotals.up_bps)}</div>
+                <svg class="dash-spark" id="dsp-up"></svg>
+                <div class="dash-sub">${formatSize(hostTotals.up_total)} total since start</div>
+            </div>
+            <div class="dash-card">
+                <div class="dash-label">Limiter</div>
+                <div class="dash-limiter-status" style="color:${limiterState.enabled ? 'var(--brand)' : 'var(--text-muted)'}">
+                    ${limiterState.enabled ? 'ON' : 'OFF'}
+                </div>
+                <div class="dash-iface">${limiterState.interface || '—'}</div>
+            </div>
+        </div>
+        <div class="dash-row">
+            <div class="dash-card">
+                <div class="dash-label">Local Network</div>
+                <div class="dash-zone-rates">
+                    <span class="download-text">↓ ${formatRate(hostTotals.lan_down_bps || 0)}</span>
+                    <span class="upload-text">↑ ${formatRate(hostTotals.lan_up_bps || 0)}</span>
+                </div>
+            </div>
+            <div class="dash-card">
+                <div class="dash-label">Internet</div>
+                <div class="dash-zone-rates">
+                    <span class="download-text">↓ ${formatRate(hostTotals.inet_down_bps || 0)}</span>
+                    <span class="upload-text">↑ ${formatRate(hostTotals.inet_up_bps || 0)}</span>
+                </div>
+            </div>
+            <div class="dash-card dash-card-wide">
+                <div class="dash-label">Top Applications</div>
+                <div class="dash-app-list">
+                    ${topApps.length === 0
+                        ? '<div class="dash-sub">No traffic observed yet.</div>'
+                        : topApps.map(a => `
+                            <div class="dash-app-row">
+                                <div class="dash-app-icon">${a.name[0].toUpperCase()}</div>
+                                <span class="dash-app-name">${a.name}</span>
+                                <div class="dash-app-rates">
+                                    <span class="download-text">↓ ${formatRate(a.down_bps)}</span>
+                                    <span class="upload-text">↑ ${formatRate(a.up_bps)}</span>
+                                </div>
+                            </div>`).join('')}
+                </div>
+            </div>
+        </div>
+    `;
+
+    createSparkline(document.getElementById('dsp-down'), hostDownHistory, 'var(--download)', 120, 32);
+    createSparkline(document.getElementById('dsp-up'),   hostUpHistory,   'var(--upload)',   120, 32);
 }
 
 function renderTopBar() {
@@ -234,33 +309,54 @@ function toggleNode(id) {
     renderTable();
 }
 
+function classifyApp(app) {
+    const lanTotal = (app.lan_down_bps || 0) + (app.lan_up_bps || 0);
+    const inetTotal = (app.inet_down_bps || 0) + (app.inet_up_bps || 0);
+    if (lanTotal === 0 && inetTotal === 0) {
+        // No live traffic: use the limit scope as a hint, default to internet.
+        const limit = appLimits.find(l => l.exe === app.exe);
+        return (limit && limit.scope.toLowerCase() === 'lan') ? 'lan' : 'internet';
+    }
+    return lanTotal >= inetTotal ? 'lan' : 'internet';
+}
+
 function renderTable() {
     const tbody = document.getElementById('apps-body');
     tbody.innerHTML = "";
 
-    // Tabs other than the main monitor show a placeholder for now.
     if (currentView !== 'Applications' && currentView !== 'Dashboard') {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td colspan="8" class="view-placeholder">${currentView} — coming soon.<br>
+        tr.innerHTML = `<td colspan="5" class="view-placeholder">${currentView} — coming soon.<br>
             <span>Use the Applications tab for live monitoring and limits.</span></td>`;
         tbody.appendChild(tr);
         return;
     }
 
-    // ONE tree rooted at "This computer". Children: the Local Network and
-    // Internet host zones, then every application — all nested under the host.
+    const filteredApps = apps.filter(app => {
+        if (!app.exe) return false;
+        if (!searchQuery) return true;
+        return app.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+               app.exe.toLowerCase().includes(searchQuery.toLowerCase());
+    });
+
+    const lanApps  = filteredApps.filter(a => classifyApp(a) === 'lan');
+    const inetApps = filteredApps.filter(a => classifyApp(a) === 'internet');
+
     renderHostRoot(tbody);
     if (expandedNodes.has('host')) {
-        renderHostRow(tbody, 'Local Network', limiterState.host.lan.down_bps, limiterState.host.lan.up_bps, 1, 'lan');
-        renderHostRow(tbody, 'Internet', limiterState.host.internet.down_bps, limiterState.host.internet.up_bps, 1, 'internet');
+        renderZoneRow(tbody, 'lan', 'Local Network',
+            limiterState.host.lan.down_bps, limiterState.host.lan.up_bps, 1,
+            hostTotals.lan_down_bps, hostTotals.lan_up_bps);
+        if (expandedNodes.has('lan')) {
+            lanApps.forEach(app => renderAppRow(tbody, app, 2));
+        }
 
-        const filteredApps = apps.filter(app => {
-            if (!app.exe) return false;
-            if (!searchQuery) return true;
-            return app.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                   app.exe.toLowerCase().includes(searchQuery.toLowerCase());
-        });
-        filteredApps.forEach(app => renderAppRow(tbody, app, 1));
+        renderZoneRow(tbody, 'internet', 'Internet',
+            limiterState.host.internet.down_bps, limiterState.host.internet.up_bps, 1,
+            hostTotals.inet_down_bps, hostTotals.inet_up_bps);
+        if (expandedNodes.has('internet')) {
+            inetApps.forEach(app => renderAppRow(tbody, app, 2));
+        }
     }
 }
 
@@ -276,21 +372,21 @@ function renderHostRoot(tbody) {
                 <span style="font-weight: 700;">This computer</span>
             </div>
         </td>
-        <td></td>
+        <td><div class="rule-cell"></div></td>
         <td><span class="download-text">${formatRate(hostTotals.down_bps)}</span></td>
         <td><span class="upload-text">${formatRate(hostTotals.up_bps)}</span></td>
-        <td class="td-down-lim"></td>
-        <td class="td-up-lim"></td>
-        <td></td>
         <td></td>
     `;
     const toggle = () => toggleNode('host');
     tr.querySelector('.tree-toggle').onclick = (e) => { e.stopPropagation(); toggle(); };
     tr.querySelector('.tree-indent > span').onclick = (e) => { e.stopPropagation(); toggle(); };
-    tr.querySelector('.td-down-lim').appendChild(
-        createSpinner(limiterState.host.down_bps, (v) => setHostLimit('host', 'down', v)));
-    tr.querySelector('.td-up-lim').appendChild(
-        createSpinner(limiterState.host.up_bps, (v) => setHostLimit('host', 'up', v)));
+
+    const ruleCell = tr.querySelector('.rule-cell');
+    const hDown = makeLimBtn('down', limiterState.host.down_bps != null);
+    const hUp   = makeLimBtn('up',   limiterState.host.up_bps   != null);
+    hDown.onclick = (e) => { e.stopPropagation(); showLimitPopup(hDown, 'host:down', 'down', limiterState.host.down_bps, (v) => setHostLimit('host', 'down', v)); };
+    hUp.onclick   = (e) => { e.stopPropagation(); showLimitPopup(hUp,   'host:up',   'up',   limiterState.host.up_bps,   (v) => setHostLimit('host', 'up',   v)); };
+    ruleCell.append(hDown, hUp);
     tbody.appendChild(tr);
 }
 
@@ -315,45 +411,34 @@ function renderTreeGroup(tbody, id, label, level) {
     tbody.appendChild(tr);
 }
 
-function renderHostRow(tbody, label, downLim, upLim, level, type) {
+function renderZoneRow(tbody, id, label, downLim, upLim, level, downRate, upRate) {
+    const isExpanded = expandedNodes.has(id);
     const tr = document.createElement('tr');
     tr.className = 'tree-row';
-    
-    // Live rate for the zone rows, split by LAN vs Internet.
-    let downRate = "—", upRate = "—";
-    if (type === 'lan') {
-        downRate = formatRate(hostTotals.lan_down_bps || 0);
-        upRate = formatRate(hostTotals.lan_up_bps || 0);
-    } else if (type === 'internet') {
-        downRate = formatRate(hostTotals.inet_down_bps || 0);
-        upRate = formatRate(hostTotals.inet_up_bps || 0);
-    } else if (type === 'host') {
-        downRate = formatRate(hostTotals.down_bps);
-        upRate = formatRate(hostTotals.up_bps);
-    }
 
     tr.innerHTML = `
         <td>
             <div class="tree-indent" style="--level: ${level}">
                 <div class="tree-guide" style="--level: ${level}"></div>
+                <div class="tree-toggle">${isExpanded ? '▼' : '▶'}</div>
                 <span style="font-weight: 600;">${label}</span>
             </div>
         </td>
-        <td></td>
-        <td><span class="download-text">${downRate}</span></td>
-        <td><span class="upload-text">${upRate}</span></td>
-        <td class="td-down-lim"></td>
-        <td class="td-up-lim"></td>
-        <td></td>
+        <td><div class="rule-cell"></div></td>
+        <td><span class="download-text">${formatRate(downRate || 0)}</span></td>
+        <td><span class="upload-text">${formatRate(upRate || 0)}</span></td>
         <td></td>
     `;
 
-    const downSpinner = createSpinner(downLim, (val) => setHostLimit(type, 'down', val));
-    const upSpinner = createSpinner(upLim, (val) => setHostLimit(type, 'up', val));
-    
-    tr.querySelector('.td-down-lim').appendChild(downSpinner);
-    tr.querySelector('.td-up-lim').appendChild(upSpinner);
+    tr.querySelector('.tree-toggle').onclick = (e) => { e.stopPropagation(); toggleNode(id); };
+    tr.querySelector('.tree-indent > span').onclick = (e) => { e.stopPropagation(); toggleNode(id); };
 
+    const zCell = tr.querySelector('.rule-cell');
+    const zDown = makeLimBtn('down', downLim != null);
+    const zUp   = makeLimBtn('up',   upLim   != null);
+    zDown.onclick = (e) => { e.stopPropagation(); showLimitPopup(zDown, `${id}:down`, 'down', downLim, (v) => setHostLimit(id, 'down', v)); };
+    zUp.onclick   = (e) => { e.stopPropagation(); showLimitPopup(zUp,   `${id}:up`,   'up',   upLim,   (v) => setHostLimit(id, 'up',   v)); };
+    zCell.append(zDown, zUp);
     tbody.appendChild(tr);
 }
 
@@ -361,31 +446,34 @@ function renderAppRow(tbody, app, level) {
     const limit = appLimits.find(l => l.exe === app.exe);
     const quota = quotas.find(q => q.exe === app.exe);
 
-    let status = "Watching";
+    let statusLabel = "Watching";
     let statusClass = "pill-muted";
     if (quota && quota.exceeded) {
-        status = "Throttled";
+        statusLabel = "Throttled";
         statusClass = "pill-rose";
     } else if (limit) {
-        status = "Limited";
+        statusLabel = "Limited";
         statusClass = "pill-emerald";
     }
+
+    const scope        = limit ? limit.scope : "Both";
+    const quotaPercent = quota ? Math.min((quota.used_bytes / quota.budget_bytes) * 100, 100) : 0;
+    const quotaExceeded = quota ? quota.exceeded : false;
+    const downLit      = limit && limit.down_bps != null;
+    const upLit        = limit && limit.up_bps   != null;
 
     const tr = document.createElement('tr');
     tr.className = 'tree-row';
     if (app.exe === selectedExe) tr.classList.add('selected');
-    
+
     tr.onclick = () => {
         selectedExe = app.exe;
-        renderDetailStrip(); // Just update detail strip, don't re-render whole table to preserve inputs
+        renderDetailStrip();
         document.querySelectorAll('#apps-body tr').forEach(r => r.classList.remove('selected'));
         tr.classList.add('selected');
     };
 
-    const scope = limit ? limit.scope : "Both";
-    const quotaPercent = quota ? Math.min((quota.used_bytes / quota.budget_bytes) * 100, 100) : 0;
-    const quotaExceeded = quota ? quota.exceeded : false;
-
+    const exeId = app.exe.replace(/\//g, '_');
     tr.innerHTML = `
         <td>
             <div class="tree-indent" style="--level: ${level}">
@@ -399,22 +487,21 @@ function renderAppRow(tbody, app, level) {
                 </div>
             </div>
         </td>
-        <td><span class="pill ${statusClass}">${status}</span></td>
+        <td><div class="rule-cell">
+            <span class="pill ${statusClass}">${statusLabel}</span>
+        </div></td>
         <td>
             <div class="rate-cell">
                 <span class="download-text">${formatRate(app.down_bps)}</span>
-                <svg class="inline-spark" id="spark-down-${app.exe.replace(/\//g, '_')}"></svg>
+                <svg class="inline-spark" id="spark-down-${exeId}"></svg>
             </div>
         </td>
         <td>
             <div class="rate-cell">
                 <span class="upload-text">${formatRate(app.up_bps)}</span>
-                <svg class="inline-spark" id="spark-up-${app.exe.replace(/\//g, '_')}"></svg>
+                <svg class="inline-spark" id="spark-up-${exeId}"></svg>
             </div>
         </td>
-        <td class="td-down-lim"></td>
-        <td class="td-up-lim"></td>
-        <td><span class="pill pill-${scope.toLowerCase()} scope-pill" style="cursor: pointer;">${scope}</span></td>
         <td>
             <div class="quota-container">
                 <div class="quota-bar-bg">
@@ -425,19 +512,28 @@ function renderAppRow(tbody, app, level) {
         </td>
     `;
 
-    const downSpinner = createSpinner(limit ? limit.down_bps : null, (val) => setAppLimit(app.exe, 'down', val));
-    const upSpinner = createSpinner(limit ? limit.up_bps : null, (val) => setAppLimit(app.exe, 'up', val));
-    
-    tr.querySelector('.td-down-lim').appendChild(downSpinner);
-    tr.querySelector('.td-up-lim').appendChild(upSpinner);
+    // Append ▼▲ buttons to the rule cell
+    const ruleCell = tr.querySelector('.rule-cell');
+    const aDown = makeLimBtn('down', downLit);
+    const aUp   = makeLimBtn('up',   upLit);
+    aDown.onclick = (e) => {
+        e.stopPropagation();
+        showLimitPopup(aDown, `${app.exe}:down`, 'down', limit ? limit.down_bps : null,
+            (v) => setAppLimit(app.exe, 'down', v));
+    };
+    aUp.onclick = (e) => {
+        e.stopPropagation();
+        showLimitPopup(aUp, `${app.exe}:up`, 'up', limit ? limit.up_bps : null,
+            (v) => setAppLimit(app.exe, 'up', v));
+    };
+    ruleCell.append(aDown, aUp);
 
-    tr.querySelector('.scope-pill').onclick = (e) => { e.stopPropagation(); cycleScope(app.exe); };
     tr.querySelector('.quota-container').onclick = (e) => { e.stopPropagation(); promptQuota(app.exe); };
 
     tbody.appendChild(tr);
 
-    createSparkline(document.getElementById(`spark-down-${app.exe.replace(/\//g, '_')}`), app.down_spark, "var(--download)");
-    createSparkline(document.getElementById(`spark-up-${app.exe.replace(/\//g, '_')}`), app.up_spark, "var(--upload)");
+    createSparkline(document.getElementById(`spark-down-${exeId}`), app.down_spark, "var(--download)");
+    createSparkline(document.getElementById(`spark-up-${exeId}`), app.up_spark, "var(--upload)");
 }
 
 function renderDetailStrip() {
@@ -447,8 +543,8 @@ function renderDetailStrip() {
         detailInfo.querySelector('.detail-title').textContent = "—";
         detailInfo.querySelector('.app-path').textContent = "—";
         detailInfo.querySelector('div:last-child').innerHTML = "";
-        document.getElementById('detail-down-val').textContent = "0 bit";
-        document.getElementById('detail-up-val').textContent = "0 bit";
+        document.getElementById('detail-down-val').textContent = "0 B/s";
+        document.getElementById('detail-up-val').textContent = "0 B/s";
         return;
     }
 
@@ -585,6 +681,98 @@ async function promptQuota(exe) {
     } catch (err) { alert(err); }
 }
 
+// --- Limit Popup ---
+
+let popupOpen = false;
+let popupApplyFn = null;
+// Remembers last typed value per key so enable/disable doesn't lose the value
+const lastLimitVal = {};
+
+function showLimitPopup(btn, key, dir, currentBps, applyFn) {
+    popupApplyFn = applyFn;
+    popupOpen = true;
+
+    const popup   = document.getElementById('limit-popup');
+    const chk     = document.getElementById('lp-enabled');
+    const inp     = document.getElementById('lp-value');
+    const dirLbl  = document.getElementById('lp-dir-label');
+
+    dirLbl.textContent = dir === 'down' ? '↓ Download limit' : '↑ Upload limit';
+    dirLbl.style.color = dir === 'down' ? 'var(--download)' : 'var(--upload)';
+
+    const isActive = currentBps != null;
+    chk.checked    = isActive;
+    // Show current value, or last remembered value, or empty
+    inp.value    = isActive ? formatRate(currentBps) : (lastLimitVal[key] || '');
+    inp.disabled = !isActive;
+
+    chk.onchange = () => {
+        inp.disabled = !chk.checked;
+        if (chk.checked) { inp.focus(); inp.select(); }
+    };
+
+    popup.style.display = 'flex';
+    const rect = btn.getBoundingClientRect();
+    let top  = rect.bottom + 5;
+    let left = rect.left - 85;
+    if (left < 6) left = 6;
+    if (left + 210 > window.innerWidth) left = window.innerWidth - 216;
+    if (top + 110 > window.innerHeight) top = rect.top - 115;
+    popup.style.top  = top  + 'px';
+    popup.style.left = left + 'px';
+
+    if (isActive) { inp.focus(); inp.select(); }
+}
+
+function hideLimitPopup() {
+    document.getElementById('limit-popup').style.display = 'none';
+    popupOpen    = false;
+    popupApplyFn = null;
+}
+
+function initLimitPopup() {
+    const okBtn = document.getElementById('lp-ok');
+    const inp   = document.getElementById('lp-value');
+    const chk   = document.getElementById('lp-enabled');
+
+    const apply = async () => {
+        if (!popupApplyFn) return;
+        const fn      = popupApplyFn;
+        const enabled = chk.checked;
+        const raw     = inp.value.trim();
+        const bps     = (enabled && raw) ? parseRate(raw) : null;
+        hideLimitPopup();
+        try { await fn(bps); } catch (err) { alert(err); }
+        poll();
+    };
+
+    okBtn.onclick      = apply;
+    inp.onkeydown = (e) => {
+        if (e.key === 'Enter')  { e.preventDefault(); apply(); }
+        if (e.key === 'Escape') { hideLimitPopup(); poll(); }
+    };
+    inp.oninput = () => { if (inp.value) lastLimitVal[currentPopupKey()] = inp.value; };
+
+    document.addEventListener('mousedown', (e) => {
+        if (popupOpen && !document.getElementById('limit-popup').contains(e.target)) {
+            hideLimitPopup(); poll();
+        }
+    }, true);
+}
+
+function currentPopupKey() {
+    // returns the key used to remember the last value
+    return document.getElementById('lp-dir-label')?.textContent || '';
+}
+
+function makeLimBtn(dir, isLit) {
+    const btn = document.createElement('button');
+    btn.className = `lim-btn ${dir}${isLit ? ' lit' : ''}`;
+    btn.title     = dir === 'down' ? 'Set download limit' : 'Set upload limit';
+    btn.textContent = dir === 'down' ? '▼' : '▲';
+    return btn;
+}
+
 // --- Init ---
 
 // Wire the top-bar master switch and search (null-safe so one missing element
@@ -604,6 +792,9 @@ document.querySelectorAll('.nav-item').forEach((item) => {
         renderTable();
     };
 });
+
+// Init limit popup
+initLimitPopup();
 
 // Start polling
 poll();

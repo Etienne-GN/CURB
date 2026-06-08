@@ -41,6 +41,16 @@ struct AppAccum {
     up_total: u64,
     last_down: u64,
     last_up: u64,
+    /// Cumulative bytes attributed to LAN remote addresses.
+    lan_down: u64,
+    lan_up: u64,
+    lan_last_down: u64,
+    lan_last_up: u64,
+    /// Cumulative bytes attributed to Internet remote addresses.
+    inet_down: u64,
+    inet_up: u64,
+    inet_last_down: u64,
+    inet_last_up: u64,
     down_spark: VecDeque<u32>,
     up_spark: VecDeque<u32>,
     idle: u32,
@@ -287,8 +297,10 @@ fn capture_loop(socket: std::os::fd::OwnedFd, inner: Arc<Inner>) {
             let app = acc.apps.entry(exe).or_default();
             if s.outgoing {
                 app.up_total += s.bytes;
+                if is_lan { app.lan_up += s.bytes; } else { app.inet_up += s.bytes; }
             } else {
                 app.down_total += s.bytes;
+                if is_lan { app.lan_down += s.bytes; } else { app.inet_down += s.bytes; }
             }
         }
         let zone = if is_lan {
@@ -322,6 +334,14 @@ impl Inner {
             let up_bps = a.up_total - a.last_up;
             a.last_down = a.down_total;
             a.last_up = a.up_total;
+            let lan_down_bps = a.lan_down - a.lan_last_down;
+            let lan_up_bps = a.lan_up - a.lan_last_up;
+            a.lan_last_down = a.lan_down;
+            a.lan_last_up = a.lan_up;
+            let inet_down_bps = a.inet_down - a.inet_last_down;
+            let inet_up_bps = a.inet_up - a.inet_last_up;
+            a.inet_last_down = a.inet_down;
+            a.inet_last_up = a.inet_up;
             push_spark(&mut a.down_spark, down_bps as u32);
             push_spark(&mut a.up_spark, up_bps as u32);
 
@@ -352,6 +372,10 @@ impl Inner {
                 down_spark: a.down_spark.iter().copied().collect(),
                 up_spark: a.up_spark.iter().copied().collect(),
                 status: AppStatus::Watching,
+                lan_down_bps,
+                lan_up_bps,
+                inet_down_bps,
+                inet_up_bps,
             });
         }
         for k in evict {

@@ -18,11 +18,11 @@
             <div class="logo-icon"></div>
             CURB
         </div>
-        <a href="#" class="nav-item">
+        <a href="#" class="nav-item active">
             <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
             Dashboard
         </a>
-        <a href="#" class="nav-item active">
+        <a href="#" class="nav-item">
             <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
             Applications
         </a>
@@ -77,17 +77,17 @@
 
         <!-- Content Area -->
         <div class="content">
-            <div class="table-container">
+            <!-- Dashboard widgets (shown only on Dashboard tab) -->
+            <div id="dashboard-view" class="dashboard-view" style="display:none;"></div>
+
+            <div class="table-container" id="table-container">
                 <table id="apps-table">
                     <thead>
                         <tr>
-                            <th style="width: 250px;">Application</th>
-                            <th>Status</th>
+                            <th style="width: 260px;">Application</th>
+                            <th style="width: 180px;">Rule</th>
                             <th>↓ Rate</th>
                             <th>↑ Rate</th>
-                            <th>↓ Limit</th>
-                            <th>↑ Limit</th>
-                            <th>Scope</th>
                             <th>Today</th>
                         </tr>
                     </thead>
@@ -127,6 +127,18 @@
                     </div>
                 </div>
             </div>
+        </div>
+    </div>
+
+    <!-- Limit contextual popup (shared, repositioned per button) -->
+    <div id="limit-popup" class="limit-popup" style="display:none;">
+        <label class="lp-row lp-enable-row">
+            <input type="checkbox" id="lp-enabled" checked>
+            <span id="lp-dir-label">Download limit</span>
+        </label>
+        <div class="lp-row">
+            <input type="text" id="lp-value" class="lp-input" placeholder="e.g. 10 MB/s">
+            <button id="lp-ok" class="lp-ok">OK</button>
         </div>
     </div>
 

@@ -293,6 +293,16 @@ pub struct AppStat {
     pub up_spark: Vec<u32>,
     /// How CURB is treating this app's traffic.
     pub status: AppStatus,
+    /// Zone breakdown — bytes/sec attributed to LAN remote addresses.
+    #[serde(default)]
+    pub lan_down_bps: u64,
+    #[serde(default)]
+    pub lan_up_bps: u64,
+    /// Zone breakdown — bytes/sec attributed to Internet remote addresses.
+    #[serde(default)]
+    pub inet_down_bps: u64,
+    #[serde(default)]
+    pub inet_up_bps: u64,
 }
 
 /// Aggregate host-wide traffic totals, with a LAN/Internet rate breakdown.

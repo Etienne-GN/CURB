@@ -6,6 +6,7 @@
 //! app's HTB class handle so the root HTB qdisc *shapes* (queues) the app's
 //! upload smoothly — replacing the drop-based nftables policing for egress.
 
+use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
@@ -23,6 +24,25 @@ pub const INGRESS_BPF_PRIORITY: u16 = 1;
 static BPF_OBJ: &[u8] = aya::include_bytes_aligned!(env!("CURB_BPF_OBJ"));
 
 const MAP_NAME: &str = "cgroup_classid";
+const FLOW_MAP: &str = "flow_classid";
+
+/// Connection key, byte-for-byte identical to `struct flow_key` in the BPF
+/// program. Address/port fields hold raw network-order bytes (as the classifier
+/// reads them from the packet), so we store octets/`to_be_bytes` directly.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlowKey {
+    saddr: [u8; 4],
+    daddr: [u8; 4],
+    sport: [u8; 2],
+    dport: [u8; 2],
+    proto: u8,
+    pad: [u8; 3],
+}
+
+// Safe: plain old data with no padding-sensitive interpretation (compared
+// byte-wise by the kernel as a map key).
+unsafe impl aya::Pod for FlowKey {}
 
 /// Owns the loaded program (keeping it attached) and its classid map.
 pub struct EbpfShaper {
@@ -91,6 +111,33 @@ impl EbpfShaper {
             bpf.map_mut(MAP_NAME).ok_or_else(|| anyhow!("map {MAP_NAME} missing"))?,
         )?;
         map.insert(cgroup_id, classid, 0)?;
+        Ok(())
+    }
+
+    /// Seed both directions of an existing IPv4 connection into the flow map so
+    /// it is classified immediately, without waiting for the cgroup path (which
+    /// only catches sockets created after a process joins its cgroup).
+    pub fn seed_flow(
+        &self,
+        local_ip: Ipv4Addr,
+        local_port: u16,
+        remote_ip: Ipv4Addr,
+        remote_port: u16,
+        proto: u8,
+        classid: u32,
+    ) -> Result<()> {
+        let mut bpf = self.bpf.lock().unwrap();
+        let mut map: BpfHashMap<_, FlowKey, u32> = BpfHashMap::try_from(
+            bpf.map_mut(FLOW_MAP).ok_or_else(|| anyhow!("map {FLOW_MAP} missing"))?,
+        )?;
+        let (l, r) = (local_ip.octets(), remote_ip.octets());
+        let (lp, rp) = (local_port.to_be_bytes(), remote_port.to_be_bytes());
+        // Outbound key (egress lookup): local -> remote.
+        let outbound = FlowKey { saddr: l, daddr: r, sport: lp, dport: rp, proto, pad: [0; 3] };
+        // Inbound key (ingress lookup): remote -> local.
+        let inbound = FlowKey { saddr: r, daddr: l, sport: rp, dport: lp, proto, pad: [0; 3] };
+        map.insert(outbound, classid, 0)?;
+        map.insert(inbound, classid, 0)?;
         Ok(())
     }
 

@@ -111,32 +111,49 @@ static __always_inline int parse_pkt(struct __sk_buff *skb, struct pkt5 *o)
     return 0;
 }
 
-// Egress: classify by the sending socket's cgroup, and remember the flow so the
-// inbound direction can be matched without a socket lookup.
+// Egress: classify by the sending socket's cgroup (new connections), falling
+// back to the flow map (existing connections, seeded by userspace from /proc).
+// On a hit, record the reverse flow so the inbound direction matches too.
 SEC("classifier")
 int curb_egress(struct __sk_buff *skb)
 {
+    __u32 classid = 0;
     __u64 cgid = bpf_skb_cgroup_id(skb);
-    if (!cgid)
-        return TC_ACT_OK;
-    __u32 *classid = bpf_map_lookup_elem(&cgroup_classid, &cgid);
+    if (cgid) {
+        __u32 *c = bpf_map_lookup_elem(&cgroup_classid, &cgid);
+        if (c)
+            classid = *c;
+    }
+
+    struct pkt5 p = {};
+    int parsed = parse_pkt(skb, &p);
+    // Existing-connection fallback: look this outbound flow up directly.
+    if (!classid && parsed == 0) {
+        struct flow_key fk = {
+            .saddr = p.saddr,
+            .daddr = p.daddr,
+            .sport = p.sport,
+            .dport = p.dport,
+            .proto = p.proto,
+        };
+        __u32 *c = bpf_map_lookup_elem(&flow_classid, &fk);
+        if (c)
+            classid = *c;
+    }
     if (!classid)
         return TC_ACT_OK;
 
-    skb->priority = *classid;
-
-    struct pkt5 p;
-    if (parse_pkt(skb, &p) == 0) {
+    skb->priority = classid;
+    if (parsed == 0) {
         // Reverse the tuple: an inbound reply has src/dst and ports swapped.
-        struct flow_key k = {
+        struct flow_key rk = {
             .saddr = p.daddr,
             .daddr = p.saddr,
             .sport = p.dport,
             .dport = p.sport,
             .proto = p.proto,
         };
-        __u32 cls = *classid;
-        bpf_map_update_elem(&flow_classid, &k, &cls, BPF_ANY);
+        bpf_map_update_elem(&flow_classid, &rk, &classid, BPF_ANY);
     }
     return TC_ACT_OK;
 }

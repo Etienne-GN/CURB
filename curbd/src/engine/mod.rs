@@ -17,6 +17,7 @@ mod nft;
 mod tc;
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -145,6 +146,9 @@ impl Engine {
                 .spawn(move || loop {
                     std::thread::sleep(RECONCILE_INTERVAL);
                     reconcile_membership(&inner);
+                    // Keep existing/long-lived connections classified (the eBPF
+                    // flow map is LRU, and apps open new connections over time).
+                    seed_existing_flows(&inner);
                 })
                 .ok();
         }
@@ -225,6 +229,7 @@ impl Engine {
         self.inner.reconcile_ingress()?;
         self.inner.reconcile_nft()?;
         reconcile_membership(&self.inner); // place existing processes now
+        seed_existing_flows(&self.inner); // catch already-open connections now
         Ok(self.list_app_limits())
     }
 
@@ -548,6 +553,111 @@ fn reconcile_membership(inner: &EngineInner) {
             cgroup::add_pid(dir, pid);
         }
     }
+}
+
+/// Seed the eBPF flow map with every tracked app's currently-open IPv4
+/// connections, so existing connections are classified immediately (the cgroup
+/// path only catches sockets created after a process joins its cgroup).
+fn seed_existing_flows(inner: &EngineInner) {
+    let Some(shaper) = &inner.shaper else {
+        return;
+    };
+    // exe -> classid for rate-limited apps.
+    let want: HashMap<String, u32> = {
+        let apps = inner.apps.lock().unwrap();
+        apps.iter()
+            .filter(|(_, r)| r.up_bps.is_some() || r.down_bps.is_some())
+            .map(|(exe, r)| (exe.clone(), classid(r.minor)))
+            .collect()
+    };
+    if want.is_empty() {
+        return;
+    }
+
+    // socket inode -> classid, from the matching apps' processes.
+    let mut inode_classid: HashMap<u64, u32> = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for ent in entries.flatten() {
+            let Some(pid) = ent.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            let exe = read_exe(pid);
+            if let Some(&cls) = want.get(&exe) {
+                for inode in socket_inodes(pid) {
+                    inode_classid.insert(inode, cls);
+                }
+            }
+        }
+    }
+    if inode_classid.is_empty() {
+        return;
+    }
+
+    for (path, proto) in [("/proc/net/tcp", 6u8), ("/proc/net/udp", 17u8)] {
+        for (lip, lport, rip, rport, inode) in parse_net_v4(path) {
+            if rport == 0 {
+                continue; // listening / unconnected socket
+            }
+            if let Some(&cls) = inode_classid.get(&inode) {
+                shaper.seed_flow(lip, lport, rip, rport, proto, cls).ok();
+            }
+        }
+    }
+}
+
+/// Socket inode numbers for a process's open file descriptors.
+fn socket_inodes(pid: u32) -> Vec<u64> {
+    let mut out = Vec::new();
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return out;
+    };
+    for fd in fds.flatten() {
+        if let Ok(target) = std::fs::read_link(fd.path()) {
+            if let Some(inode) = target
+                .to_str()
+                .and_then(|t| t.strip_prefix("socket:["))
+                .and_then(|t| t.strip_suffix(']'))
+                .and_then(|t| t.parse::<u64>().ok())
+            {
+                out.push(inode);
+            }
+        }
+    }
+    out
+}
+
+/// Parse an IPv4 `/proc/net/{tcp,udp}` table into (local, lport, remote, rport, inode).
+fn parse_net_v4(path: &str) -> Vec<(Ipv4Addr, u16, Ipv4Addr, u16, u64)> {
+    let mut out = Vec::new();
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    for line in content.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 10 {
+            continue;
+        }
+        let (Some((lip, lport)), Some((rip, rport)), Ok(inode)) = (
+            parse_v4_endpoint(f[1]),
+            parse_v4_endpoint(f[2]),
+            f[9].parse::<u64>(),
+        ) else {
+            continue;
+        };
+        out.push((lip, lport, rip, rport, inode));
+    }
+    out
+}
+
+/// Parse a `/proc/net` `HEXADDR:HEXPORT` IPv4 endpoint (little-endian word).
+fn parse_v4_endpoint(s: &str) -> Option<(Ipv4Addr, u16)> {
+    let (addr, port) = s.split_once(':')?;
+    if addr.len() != 8 {
+        return None;
+    }
+    let word = u32::from_str_radix(addr, 16).ok()?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    Some((Ipv4Addr::from(word.to_le_bytes()), port))
 }
 
 /// Read `/proc/<pid>/exe`, stripping the kernel's " (deleted)" suffix.

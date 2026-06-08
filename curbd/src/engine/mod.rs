@@ -383,7 +383,9 @@ impl EngineInner {
 
         // Per-app upload classes (steered by the classifier) + the full set of
         // rate-limited apps that need a cgroup->classid map entry.
-        let (up_apps, mapped): (Vec<(u16, u64)>, Vec<(u16, String)>) = {
+        type UpApps = Vec<(u16, u64)>;
+        type MappedApps = Vec<(u16, String)>;
+        let (up_apps, mapped): (UpApps, MappedApps) = {
             let apps = self.apps.lock().unwrap();
             let up = apps
                 .values()

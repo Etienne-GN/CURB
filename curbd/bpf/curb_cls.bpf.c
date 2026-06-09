@@ -208,4 +208,27 @@ int curb_ingress_setprio(struct __sk_buff *skb)
     return TC_ACT_UNSPEC; // continue to the mirred redirect filter
 }
 
+// Ingress mark: set skb->mark from the flow map so nftables can police
+// by `meta mark` — works for existing connections (seeded at limit-set
+// time) and new ones (reverse flow recorded by curb_egress on first SYN).
+// Never redirects or drops; completely safe on a live interface.
+SEC("classifier")
+int curb_ingress_setmark(struct __sk_buff *skb)
+{
+    struct pkt5 p = {};
+    if (parse_pkt(skb, &p) == 0) {
+        struct flow_key k = {
+            .saddr = p.saddr,
+            .daddr = p.daddr,
+            .sport = p.sport,
+            .dport = p.dport,
+            .proto = p.proto,
+        };
+        __u32 *classid = bpf_map_lookup_elem(&flow_classid, &k);
+        if (classid)
+            skb->mark = *classid;
+    }
+    return TC_ACT_UNSPEC;
+}
+
 char _license[] SEC("license") = "GPL";

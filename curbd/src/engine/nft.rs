@@ -28,7 +28,11 @@ const V6_PRIVATE: &str = "::1, fc00::/7, fe80::/10";
 /// One app's policing parameters for the ruleset generator.
 pub struct AppRule {
     /// App cgroup path relative to the cgroup root (e.g. `curb/firefox-3f9a`).
+    /// Used only for quota-block rules (which must catch new connections too).
     pub cgroup_rel: String,
+    /// tc classid for this app (e.g. `0x00010010`). Used as `skb->mark` for
+    /// download policing via `meta mark`, which works for existing connections.
+    pub classid: u32,
     pub down_bps: Option<u64>,
     pub up_bps: Option<u64>,
     /// Restrict the rule to LAN, Internet, or both remotes.
@@ -96,14 +100,15 @@ pub fn apply(rules: &[AppRule]) -> Result<()> {
             ));
             continue;
         }
-        // Download: police inbound at the input hook; remote is the source.
+        // Download: police inbound via skb->mark set by the eBPF ingress
+        // classifier — works for both new and existing connections (the flow
+        // map is seeded at limit-set time for existing sockets).
         if let Some(down) = r.down_bps {
             for clause in scope_clauses(r.scope, "saddr") {
                 s.push_str(&format!(
-                    "add rule inet curb input socket cgroupv2 level {lvl} \"{cg}\" \
+                    "add rule inet curb input meta mark {mark} \
                      {clause}limit rate over {rate} bytes/second burst {burst} bytes drop\n",
-                    lvl = cgroup::APP_LEVEL,
-                    cg = r.cgroup_rel,
+                    mark = r.classid,
                     rate = down,
                     burst = burst(down),
                 ));

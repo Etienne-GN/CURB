@@ -78,6 +78,24 @@ impl EbpfShaper {
             .attach(iface, TcAttachType::Egress)
             .context("attaching curb_egress")?;
 
+        // Always attach the mark-setter: reads flow map, sets skb->mark,
+        // returns TC_ACT_UNSPEC — safe on any live interface.
+        let setmark: &mut SchedClassifier = bpf
+            .program_mut("curb_ingress_setmark")
+            .ok_or_else(|| anyhow!("curb_ingress_setmark program missing"))?
+            .try_into()?;
+        setmark.load().context("loading curb_ingress_setmark")?;
+        setmark
+            .attach_with_options(
+                iface,
+                TcAttachType::Ingress,
+                TcAttachOptions::Netlink(NlOptions {
+                    priority: INGRESS_BPF_PRIORITY + 1, // prio 2, after setprio if active
+                    handle: 0,
+                }),
+            )
+            .context("attaching curb_ingress_setmark")?;
+
         if ingress {
             let setprio: &mut SchedClassifier = bpf
                 .program_mut("curb_ingress_setprio")
@@ -94,9 +112,9 @@ impl EbpfShaper {
                     }),
                 )
                 .context("attaching curb_ingress_setprio")?;
-            info!(iface, "eBPF egress + ingress(set-priority) classifiers attached");
+            info!(iface, "eBPF egress + ingress(set-priority+mark) classifiers attached");
         } else {
-            info!(iface, "eBPF egress classifier attached");
+            info!(iface, "eBPF egress + ingress(set-mark) classifiers attached");
         }
 
         Ok(Self {

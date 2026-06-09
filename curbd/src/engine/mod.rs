@@ -503,6 +503,7 @@ impl EngineInner {
             apps.values()
                 .map(|r| nft::AppRule {
                     cgroup_rel: cgroup::app_rel(&r.dir),
+                    classid: (1u32 << 16) | (r.minor as u32),
                     // Omit a direction here when eBPF HTB shapes it.
                     down_bps: if ebpf_ingress { None } else { r.down_bps },
                     up_bps: if ebpf_egress { None } else { r.up_bps },

@@ -92,6 +92,8 @@ pub enum Request {
     ClearQuota { exe: String },
     /// List configured quotas with live usage (P5).
     ListQuotas,
+    /// List all active TCP/UDP connections attributed to their owning app.
+    ListConnections,
 }
 
 /// The daemon's reply to a [`Request`].
@@ -109,6 +111,8 @@ pub enum Response {
     AppLimits(Vec<AppLimit>),
     /// Reply to quota requests (P5).
     Quotas(Vec<QuotaStatus>),
+    /// Reply to [`Request::ListConnections`].
+    Connections(Vec<ConnectionInfo>),
     /// Generic success for requests with no payload.
     Ok,
     /// The request could not be served.
@@ -190,6 +194,25 @@ pub struct QuotaStatus {
     pub exceeded: bool,
     /// Seconds until the period resets (`None` for [`QuotaPeriod::Total`]).
     pub resets_in_secs: Option<u64>,
+}
+
+/// An individual TCP/UDP connection attributed to an application.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionInfo {
+    /// Absolute executable path of the owning process (`""` if unknown).
+    pub exe: String,
+    /// Display name (basename, or `"?"` if unknown).
+    pub name: String,
+    /// Owning PID (0 if unknown).
+    pub pid: u32,
+    /// `"TCP"` or `"UDP"`.
+    pub proto: String,
+    /// `"addr:port"`.
+    pub local_addr: String,
+    /// `"addr:port"`.
+    pub remote_addr: String,
+    /// TCP state string (`"ESTABLISHED"`, `"TIME_WAIT"`, …); `"UDP"` for UDP.
+    pub state: String,
 }
 
 /// Which traffic a limit applies to, by remote address class (P4).

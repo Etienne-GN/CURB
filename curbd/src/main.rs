@@ -291,6 +291,10 @@ fn dispatch(req: Request, state: &State) -> Response {
             Some(q) => Response::Quotas(q.list()),
             None => quota_unavailable(),
         },
+        Request::ListConnections => match &state.engine {
+            Some(e) => Response::Connections(e.list_connections()),
+            None => Response::Connections(Vec::new()),
+        },
     }
 }
 

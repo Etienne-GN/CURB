@@ -16,8 +16,10 @@ let hostTotals = { down_bps: 0, up_bps: 0, down_total: 0, up_total: 0 };
 let limiterState = { enabled: false, host: { down_bps: null, up_bps: null, lan: { down_bps: null, up_bps: null }, internet: { down_bps: null, up_bps: null } }, interface: "" };
 let appLimits = [];
 let quotas = [];
+let connections = [];
 let selectedExe = null;
 let searchQuery = "";
+let connFilter = "";
 let hostDownHistory = Array(60).fill(0);
 let hostUpHistory = Array(60).fill(0);
 let expandedNodes = new Set(['host', 'lan', 'internet']); // all expanded by default
@@ -113,15 +115,35 @@ function createAreaGraph(svg, data, color) {
     `;
 }
 
+// --- Helpers ---
+
+function escHtml(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function formatResetTime(secs) {
+    if (secs === null || secs === undefined) return 'never';
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+    return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`;
+}
+
 // --- Data Fetching ---
 
 async function poll() {
     try {
-        const [snapshot, limiter, limits, q] = await Promise.all([
+        const fetchConns = currentView === 'Connections';
+        const [snapshot, limiter, limits, q, conns] = await Promise.all([
             invoke('list_apps'),
             invoke('get_limiter'),
             invoke('list_app_limits'),
-            invoke('list_quotas')
+            invoke('list_quotas'),
+            fetchConns ? invoke('list_connections') : Promise.resolve([]),
         ]);
 
         apps = snapshot.apps;
@@ -129,6 +151,7 @@ async function poll() {
         limiterState = limiter;
         appLimits = limits;
         quotas = q;
+        if (fetchConns) connections = conns;
 
         // Update host history
         hostDownHistory.push(hostTotals.down_bps);
@@ -209,16 +232,20 @@ function createSpinner(value, onUpdate) {
 
 function renderUI() {
     renderTopBar();
+
+    const v = currentView;
+    document.getElementById('dashboard-view').style.display    = v === 'Dashboard'    ? 'flex' : 'none';
+    document.getElementById('table-container').style.display   = v === 'Applications' ? ''     : 'none';
+    document.getElementById('rules-view').style.display        = v === 'Rules'        ? ''     : 'none';
+    document.getElementById('quotas-view').style.display       = v === 'Quotas'       ? ''     : 'none';
+    document.getElementById('connections-view').style.display  = v === 'Connections'  ? ''     : 'none';
+
     if (!popupOpen) {
-        if (currentView === 'Dashboard') {
-            document.getElementById('table-container').style.display = 'none';
-            document.getElementById('dashboard-view').style.display  = 'flex';
-            renderDashboard();
-        } else {
-            document.getElementById('table-container').style.display = '';
-            document.getElementById('dashboard-view').style.display  = 'none';
-            renderTable();
-        }
+        if      (v === 'Dashboard')    renderDashboard();
+        else if (v === 'Applications') renderTable();
+        else if (v === 'Rules')        renderRules();
+        else if (v === 'Quotas')       renderQuotas();
+        else if (v === 'Connections')  renderConnections();
     }
     renderDetailStrip();
 }
@@ -323,14 +350,6 @@ function classifyApp(app) {
 function renderTable() {
     const tbody = document.getElementById('apps-body');
     tbody.innerHTML = "";
-
-    if (currentView !== 'Applications' && currentView !== 'Dashboard') {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td colspan="5" class="view-placeholder">${currentView} — coming soon.<br>
-            <span>Use the Applications tab for live monitoring and limits.</span></td>`;
-        tbody.appendChild(tr);
-        return;
-    }
 
     const filteredApps = apps.filter(app => {
         if (!app.exe) return false;
@@ -577,6 +596,435 @@ function renderDetailStrip() {
     createAreaGraph(document.getElementById('svg-detail-up'), app.up_spark, "var(--upload)");
 }
 
+// --- Rules Tab ---
+
+function renderRules() {
+    const view = document.getElementById('rules-view');
+    view.innerHTML = `
+        <div class="tab-toolbar">
+            <button class="tab-add-btn" id="rules-add-btn">+ Add Rule</button>
+        </div>
+    `;
+    document.getElementById('rules-add-btn').onclick = () => showRuleModal(null);
+
+    if (appLimits.length === 0) {
+        view.insertAdjacentHTML('beforeend',
+            '<div class="tab-empty">No rules configured. Set limits from the Applications tab or click Add.</div>');
+        return;
+    }
+
+    const wrap = document.createElement('div');
+    wrap.className = 'table-container';
+    const table = document.createElement('table');
+    table.innerHTML = `<thead><tr>
+        <th>Application</th>
+        <th style="width:90px;">Scope</th>
+        <th style="width:110px;">↓ Download</th>
+        <th style="width:110px;">↑ Upload</th>
+        <th style="width:72px;">Actions</th>
+    </tr></thead>`;
+    const tbody = document.createElement('tbody');
+
+    for (const r of appLimits) {
+        const tr = document.createElement('tr');
+
+        const appTd = document.createElement('td');
+        const appCell = document.createElement('div');
+        appCell.className = 'app-cell';
+        const icon = document.createElement('div');
+        icon.className = 'app-icon';
+        icon.textContent = r.name[0].toUpperCase();
+        const info = document.createElement('div');
+        info.className = 'app-info';
+        const nm = document.createElement('span');
+        nm.className = 'app-name';
+        nm.textContent = r.name;
+        const pth = document.createElement('span');
+        pth.className = 'app-path';
+        pth.textContent = r.exe;
+        info.append(nm, pth);
+        appCell.append(icon, info);
+        appTd.appendChild(appCell);
+
+        const scopeTd = document.createElement('td');
+        const pill = document.createElement('span');
+        pill.className = `pill pill-${r.scope.toLowerCase()}`;
+        pill.textContent = r.scope;
+        scopeTd.appendChild(pill);
+
+        const downTd = document.createElement('td');
+        downTd.className = 'mono download-text';
+        downTd.textContent = formatRate(r.down_bps);
+
+        const upTd = document.createElement('td');
+        upTd.className = 'mono upload-text';
+        upTd.textContent = formatRate(r.up_bps);
+
+        const actTd = document.createElement('td');
+        const btns = document.createElement('div');
+        btns.className = 'action-btns';
+        const editBtn = document.createElement('button');
+        editBtn.className = 'action-btn';
+        editBtn.title = 'Edit rule';
+        editBtn.textContent = '✏';
+        editBtn.onclick = () => showRuleModal(r);
+        const delBtn = document.createElement('button');
+        delBtn.className = 'action-btn action-btn-del';
+        delBtn.title = 'Remove rule';
+        delBtn.textContent = '✕';
+        delBtn.onclick = () => deleteRule(r.exe);
+        btns.append(editBtn, delBtn);
+        actTd.appendChild(btns);
+
+        tr.append(appTd, scopeTd, downTd, upTd, actTd);
+        tbody.appendChild(tr);
+    }
+
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    view.appendChild(wrap);
+}
+
+function showRuleModal(existing) {
+    const isNew = !existing;
+    const fields = [
+        ...(isNew ? [{ id: 'exe', label: 'Executable path', placeholder: '/usr/bin/firefox', value: '' }] : []),
+        { id: 'down', label: '↓ Download limit (e.g. 5 MB/s, or blank for unlimited)', placeholder: 'unlimited', value: existing ? formatRate(existing.down_bps) : '' },
+        { id: 'up',   label: '↑ Upload limit',   placeholder: 'unlimited', value: existing ? formatRate(existing.up_bps)   : '' },
+        {
+            id: 'scope', label: 'Scope', type: 'select', value: existing ? existing.scope.toLowerCase() : 'both',
+            options: [{ value: 'both', label: 'Both (LAN + Internet)' }, { value: 'lan', label: 'LAN only' }, { value: 'internet', label: 'Internet only' }],
+        },
+    ];
+    showModal(isNew ? 'Add Rule' : `Edit Rule — ${existing.name}`, fields, async (vals) => {
+        const exe   = isNew ? vals.exe.trim() : existing.exe;
+        const downBps = vals.down.trim() ? parseRate(vals.down) : null;
+        const upBps   = vals.up.trim()   ? parseRate(vals.up)   : null;
+        const scope   = vals.scope;
+        if (!exe) return;
+        try {
+            await invoke('set_app_limit', { exe, downBps, upBps, scope });
+            poll();
+        } catch (err) { alert(err); }
+    });
+}
+
+async function deleteRule(exe) {
+    try {
+        await invoke('clear_app_limit', { exe });
+        poll();
+    } catch (err) { alert(err); }
+}
+
+// --- Quotas Tab ---
+
+function renderQuotas() {
+    const view = document.getElementById('quotas-view');
+    view.innerHTML = `
+        <div class="tab-toolbar">
+            <button class="tab-add-btn" id="quotas-add-btn">+ Add Quota</button>
+        </div>
+    `;
+    document.getElementById('quotas-add-btn').onclick = () => showQuotaModal(null);
+
+    if (quotas.length === 0) {
+        view.insertAdjacentHTML('beforeend',
+            '<div class="tab-empty">No quotas configured. Click Add to set a data budget for an application.</div>');
+        return;
+    }
+
+    const wrap = document.createElement('div');
+    wrap.className = 'table-container';
+    const table = document.createElement('table');
+    table.innerHTML = `<thead><tr>
+        <th>Application</th>
+        <th style="width:90px;">Budget</th>
+        <th style="width:150px;">Used</th>
+        <th style="width:80px;">Period</th>
+        <th style="width:60px;">Dir</th>
+        <th style="width:90px;">Resets in</th>
+        <th style="width:80px;">Status</th>
+        <th style="width:72px;">Actions</th>
+    </tr></thead>`;
+    const tbody = document.createElement('tbody');
+
+    for (const q of quotas) {
+        const pct = Math.min((q.used_bytes / q.budget_bytes) * 100, 100);
+        const barColor = q.exceeded ? 'var(--danger)' : pct > 80 ? '#fb923c' : 'var(--brand)';
+
+        const tr = document.createElement('tr');
+
+        // App cell
+        const appTd = document.createElement('td');
+        const appCell = document.createElement('div');
+        appCell.className = 'app-cell';
+        const icon = document.createElement('div');
+        icon.className = 'app-icon';
+        icon.textContent = q.name[0].toUpperCase();
+        const info = document.createElement('div');
+        info.className = 'app-info';
+        const nm = document.createElement('span');
+        nm.className = 'app-name';
+        nm.textContent = q.name;
+        const pth = document.createElement('span');
+        pth.className = 'app-path';
+        pth.textContent = q.exe;
+        info.append(nm, pth);
+        appCell.append(icon, info);
+        appTd.appendChild(appCell);
+
+        const budgetTd = document.createElement('td');
+        budgetTd.className = 'mono';
+        budgetTd.textContent = formatSize(q.budget_bytes);
+
+        const usedTd = document.createElement('td');
+        usedTd.innerHTML = `
+            <div style="display:flex;flex-direction:column;gap:3px;">
+                <div style="height:4px;background:var(--border);border-radius:2px;overflow:hidden;">
+                    <div style="height:100%;width:${pct.toFixed(1)}%;background:${barColor};border-radius:2px;"></div>
+                </div>
+                <span class="mono" style="font-size:10px;color:var(--text-muted);">
+                    ${formatSize(q.used_bytes)} / ${formatSize(q.budget_bytes)}
+                </span>
+            </div>`;
+
+        const periodTd = document.createElement('td');
+        periodTd.textContent = q.period;
+
+        const dirTd = document.createElement('td');
+        dirTd.textContent = q.direction === 'Down' ? '↓' : q.direction === 'Up' ? '↑' : '↓↑';
+
+        const resetTd = document.createElement('td');
+        resetTd.className = 'mono';
+        resetTd.style.color = 'var(--text-muted)';
+        resetTd.textContent = formatResetTime(q.resets_in_secs);
+
+        const statusTd = document.createElement('td');
+        const pill = document.createElement('span');
+        pill.className = `pill ${q.exceeded ? 'pill-rose' : 'pill-emerald'}`;
+        pill.textContent = q.exceeded ? 'EXCEEDED' : 'OK';
+        statusTd.appendChild(pill);
+
+        const actTd = document.createElement('td');
+        const btns = document.createElement('div');
+        btns.className = 'action-btns';
+        const editBtn = document.createElement('button');
+        editBtn.className = 'action-btn';
+        editBtn.title = 'Edit quota';
+        editBtn.textContent = '✏';
+        editBtn.onclick = () => showQuotaModal(q);
+        const delBtn = document.createElement('button');
+        delBtn.className = 'action-btn action-btn-del';
+        delBtn.title = 'Remove quota';
+        delBtn.textContent = '✕';
+        delBtn.onclick = () => deleteQuota(q.exe);
+        btns.append(editBtn, delBtn);
+        actTd.appendChild(btns);
+
+        tr.append(appTd, budgetTd, usedTd, periodTd, dirTd, resetTd, statusTd, actTd);
+        tbody.appendChild(tr);
+    }
+
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    view.appendChild(wrap);
+}
+
+function showQuotaModal(existing) {
+    const isNew = !existing;
+    const fields = [
+        ...(isNew ? [{ id: 'exe', label: 'Executable path', placeholder: '/usr/bin/firefox', value: '' }] : []),
+        { id: 'budget', label: 'Budget (e.g. 10 GB, 500 MB)', placeholder: '10 GB', value: existing ? formatSize(existing.budget_bytes) : '' },
+        {
+            id: 'period', label: 'Reset period', type: 'select',
+            value: existing ? existing.period.toLowerCase() : 'daily',
+            options: [
+                { value: 'hourly', label: 'Hourly' }, { value: 'daily', label: 'Daily' },
+                { value: 'weekly', label: 'Weekly' }, { value: 'monthly', label: 'Monthly' },
+                { value: 'total', label: 'Total (never resets)' },
+            ],
+        },
+        {
+            id: 'direction', label: 'Count', type: 'select',
+            value: existing ? existing.direction.toLowerCase() : 'both',
+            options: [
+                { value: 'both', label: 'Download + Upload' },
+                { value: 'down', label: 'Download only' },
+                { value: 'up',   label: 'Upload only' },
+            ],
+        },
+    ];
+    showModal(isNew ? 'Add Quota' : `Edit Quota — ${existing.name}`, fields, async (vals) => {
+        const exe = isNew ? vals.exe.trim() : existing.exe;
+        const budgetBytes = parseSize(vals.budget);
+        if (!exe) { alert('Executable path is required.'); return; }
+        if (!budgetBytes) { alert('Invalid budget. Use e.g. "10 GB" or "500 MB".'); return; }
+        try {
+            await invoke('set_quota', { exe, budgetBytes, period: vals.period, direction: vals.direction });
+            poll();
+        } catch (err) { alert(err); }
+    });
+}
+
+async function deleteQuota(exe) {
+    try {
+        await invoke('clear_quota', { exe });
+        poll();
+    } catch (err) { alert(err); }
+}
+
+// --- Connections Tab ---
+
+function renderConnections() {
+    const tbody = document.getElementById('conn-tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    const q = connFilter.toLowerCase();
+    const filtered = connections.filter(c =>
+        !q || c.name.toLowerCase().includes(q) ||
+        c.remote_addr.includes(q) || c.local_addr.includes(q) || c.exe.toLowerCase().includes(q)
+    );
+
+    const countEl = document.getElementById('conn-count');
+    if (countEl) countEl.textContent = `${filtered.length} connection${filtered.length !== 1 ? 's' : ''}`;
+
+    if (filtered.length === 0) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 6;
+        td.className = 'tab-empty';
+        td.textContent = connections.length === 0
+            ? 'No active connections found.'
+            : 'No connections match the filter.';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+    }
+
+    for (const c of filtered) {
+        const tr = document.createElement('tr');
+
+        const nameTd = document.createElement('td');
+        const appCell = document.createElement('div');
+        appCell.className = 'app-cell';
+        const icon = document.createElement('div');
+        icon.className = 'app-icon';
+        icon.style.fontSize = '9px';
+        icon.textContent = (c.name[0] || '?').toUpperCase();
+        const info = document.createElement('div');
+        info.className = 'app-info';
+        const nm = document.createElement('span');
+        nm.className = 'app-name';
+        nm.textContent = c.name;
+        info.appendChild(nm);
+        appCell.append(icon, info);
+        nameTd.appendChild(appCell);
+
+        const pidTd = document.createElement('td');
+        pidTd.className = 'mono';
+        pidTd.style.color = 'var(--text-muted)';
+        pidTd.textContent = c.pid || '—';
+
+        const protoTd = document.createElement('td');
+        const protoPill = document.createElement('span');
+        protoPill.className = `pill ${c.proto === 'TCP' ? 'pill-emerald' : 'pill-both'}`;
+        protoPill.textContent = c.proto;
+        protoTd.appendChild(protoPill);
+
+        const localTd = document.createElement('td');
+        localTd.className = 'mono addr-cell';
+        localTd.textContent = c.local_addr;
+
+        const remoteTd = document.createElement('td');
+        remoteTd.className = 'mono addr-cell';
+        remoteTd.textContent = c.remote_addr;
+
+        const stateTd = document.createElement('td');
+        const stateClass =
+            c.state === 'ESTABLISHED' ? 'state-estab' :
+            c.state === 'TIME_WAIT'   ? 'state-tw'    :
+            c.state === 'LISTEN'      ? 'state-listen' :
+            c.state === 'UDP'         ? 'state-udp'   : 'state-other';
+        const statePill = document.createElement('span');
+        statePill.className = `conn-state ${stateClass}`;
+        statePill.textContent = c.state;
+        stateTd.appendChild(statePill);
+
+        tr.append(nameTd, pidTd, protoTd, localTd, remoteTd, stateTd);
+        tbody.appendChild(tr);
+    }
+}
+
+// --- Modal System ---
+
+let modalOkHandler = null;
+
+function showModal(title, fields, onOk) {
+    modalOkHandler = onOk;
+    document.getElementById('modal-title').textContent = title;
+
+    const body = document.getElementById('modal-body');
+    body.innerHTML = '';
+
+    for (const f of fields) {
+        const row = document.createElement('div');
+        row.className = 'modal-field';
+
+        const lbl = document.createElement('label');
+        lbl.className = 'modal-label';
+        lbl.textContent = f.label;
+        lbl.htmlFor = 'mf-' + f.id;
+        row.appendChild(lbl);
+
+        if (f.type === 'select') {
+            const sel = document.createElement('select');
+            sel.id = 'mf-' + f.id;
+            sel.className = 'modal-select';
+            for (const opt of f.options) {
+                const o = document.createElement('option');
+                o.value = opt.value;
+                o.textContent = opt.label;
+                if (opt.value === f.value) o.selected = true;
+                sel.appendChild(o);
+            }
+            row.appendChild(sel);
+        } else {
+            const inp = document.createElement('input');
+            inp.id = 'mf-' + f.id;
+            inp.className = 'modal-input';
+            inp.type = 'text';
+            inp.value = f.value || '';
+            inp.placeholder = f.placeholder || '';
+            inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyModal(); });
+            row.appendChild(inp);
+        }
+
+        body.appendChild(row);
+    }
+
+    document.getElementById('modal-overlay').style.display = 'flex';
+    const first = body.querySelector('input, select');
+    if (first) { first.focus(); if (first.select) first.select(); }
+}
+
+function hideModal() {
+    document.getElementById('modal-overlay').style.display = 'none';
+    modalOkHandler = null;
+}
+
+function applyModal() {
+    if (!modalOkHandler) return;
+    const body = document.getElementById('modal-body');
+    const vals = {};
+    body.querySelectorAll('input, select').forEach(el => {
+        vals[el.id.replace('mf-', '')] = el.value;
+    });
+    const fn = modalOkHandler;
+    hideModal();
+    fn(vals);
+}
+
 // --- Mutations ---
 
 async function toggleMasterLimiter() {
@@ -701,10 +1149,9 @@ function showLimitPopup(btn, key, dir, currentBps, applyFn) {
     dirLbl.style.color = dir === 'down' ? 'var(--download)' : 'var(--upload)';
 
     const isActive = currentBps != null;
-    chk.checked    = isActive;
-    // Show current value, or last remembered value, or empty
-    inp.value    = isActive ? formatRate(currentBps) : (lastLimitVal[key] || '');
-    inp.disabled = !isActive;
+    chk.checked = true;  // always start ready to set/keep a limit
+    inp.value   = isActive ? formatRate(currentBps) : (lastLimitVal[key] || '');
+    inp.disabled = false;
 
     chk.onchange = () => {
         inp.disabled = !chk.checked;
@@ -795,6 +1242,21 @@ document.querySelectorAll('.nav-item').forEach((item) => {
 
 // Init limit popup
 initLimitPopup();
+
+// Wire modal OK/Cancel
+document.getElementById('modal-ok').onclick = applyModal;
+document.getElementById('modal-cancel').onclick = hideModal;
+document.getElementById('modal-overlay').addEventListener('mousedown', (e) => {
+    if (e.target === document.getElementById('modal-overlay')) hideModal();
+});
+
+// Wire connections filter
+document.addEventListener('input', (e) => {
+    if (e.target.id === 'conn-filter') {
+        connFilter = e.target.value;
+        renderConnections();
+    }
+});
 
 // Start polling
 poll();

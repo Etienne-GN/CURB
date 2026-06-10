@@ -8,8 +8,8 @@
 //! the single source of truth.
 
 use curb_proto::{
-    AppLimit, Client, Direction, LimiterState, MonitorSnapshot, QuotaPeriod, QuotaStatus, Request,
-    Response, Scope,
+    AppLimit, Client, ConnectionInfo, Direction, LimiterState, MonitorSnapshot, QuotaPeriod,
+    QuotaStatus, Request, Response, Scope,
 };
 
 /// Connect to the daemon at the resolved socket path (`$CURB_SOCK` or default).
@@ -187,6 +187,16 @@ async fn set_quota(
     }
 }
 
+/// All active TCP/UDP connections with their owning app.
+#[tauri::command]
+async fn list_connections() -> Result<Vec<ConnectionInfo>, String> {
+    match call(Request::ListConnections).await? {
+        Response::Connections(v) => Ok(v),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
 /// Remove an application's quota.
 #[tauri::command]
 async fn clear_quota(exe: String) -> Result<Vec<QuotaStatus>, String> {
@@ -206,6 +216,7 @@ pub fn run() {
             get_limiter,
             list_app_limits,
             list_quotas,
+            list_connections,
             set_host_limit,
             set_limiter_enabled,
             set_app_limit,

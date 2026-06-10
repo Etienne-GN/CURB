@@ -353,6 +353,77 @@ impl Engine {
         out
     }
 
+    /// Enumerate active TCP/UDP connections and attribute each to its owning app.
+    ///
+    /// Scans `/proc/*/fd` for socket inodes, then joins against
+    /// `/proc/net/tcp` and `/proc/net/udp`. Skips listening/unconnected sockets.
+    pub fn list_connections(&self) -> Vec<curb_proto::ConnectionInfo> {
+        // inode -> (pid, exe)
+        let mut inode_owner: HashMap<u64, (u32, String)> = HashMap::new();
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for ent in entries.flatten() {
+                let Some(pid) = ent
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                let exe = read_exe(pid);
+                for inode in socket_inodes(pid) {
+                    inode_owner.entry(inode).or_insert((pid, exe.clone()));
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+
+        for (path, proto_str) in [("/proc/net/tcp", "TCP"), ("/proc/net/udp", "UDP")] {
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for line in content.lines().skip(1) {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() < 10 {
+                    continue;
+                }
+                let (Some((lip, lport)), Some((rip, rport)), Ok(inode)) = (
+                    parse_v4_endpoint(f[1]),
+                    parse_v4_endpoint(f[2]),
+                    f[9].parse::<u64>(),
+                ) else {
+                    continue;
+                };
+                if rport == 0 {
+                    continue; // listening / unconnected
+                }
+                let state = if proto_str == "TCP" {
+                    tcp_state_str(f[3]).to_string()
+                } else {
+                    "UDP".to_string()
+                };
+                let (pid, exe) = inode_owner.get(&inode).cloned().unwrap_or((0, String::new()));
+                let name = if exe.is_empty() {
+                    "?".to_string()
+                } else {
+                    basename(&exe)
+                };
+                out.push(curb_proto::ConnectionInfo {
+                    exe,
+                    name,
+                    pid,
+                    proto: proto_str.to_string(),
+                    local_addr: format!("{}:{}", lip, lport),
+                    remote_addr: format!("{}:{}", rip, rport),
+                    state,
+                });
+            }
+        }
+
+        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.pid.cmp(&b.pid)));
+        out
+    }
+
     /// Remove all CURB kernel state. Call on daemon shutdown.
     pub fn shutdown(&self) {
         tc::clear_egress(&self.inner.iface);
@@ -669,6 +740,23 @@ fn read_exe(pid: u32) -> String {
     raw.strip_suffix(" (deleted)")
         .map(str::to_string)
         .unwrap_or(raw)
+}
+
+fn tcp_state_str(code: &str) -> &'static str {
+    match code {
+        "01" => "ESTABLISHED",
+        "02" => "SYN_SENT",
+        "03" => "SYN_RECV",
+        "04" => "FIN_WAIT1",
+        "05" => "FIN_WAIT2",
+        "06" => "TIME_WAIT",
+        "07" => "CLOSE",
+        "08" => "CLOSE_WAIT",
+        "09" => "LAST_ACK",
+        "0A" => "LISTEN",
+        "0B" => "CLOSING",
+        _ => "UNKNOWN",
+    }
 }
 
 fn basename(path: &str) -> String {

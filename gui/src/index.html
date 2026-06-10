@@ -77,10 +77,11 @@
 
         <!-- Content Area -->
         <div class="content">
-            <!-- Dashboard widgets (shown only on Dashboard tab) -->
+            <!-- Dashboard tab -->
             <div id="dashboard-view" class="dashboard-view" style="display:none;"></div>
 
-            <div class="table-container" id="table-container">
+            <!-- Applications tab -->
+            <div class="table-container" id="table-container" style="display:none;">
                 <table id="apps-table">
                     <thead>
                         <tr>
@@ -91,10 +92,37 @@
                             <th>Today</th>
                         </tr>
                     </thead>
-                    <tbody id="apps-body">
-                        <!-- Rows will be injected by JS -->
-                    </tbody>
+                    <tbody id="apps-body"></tbody>
                 </table>
+            </div>
+
+            <!-- Rules tab -->
+            <div id="rules-view" style="display:none;"></div>
+
+            <!-- Quotas tab -->
+            <div id="quotas-view" style="display:none;"></div>
+
+            <!-- Connections tab -->
+            <div id="connections-view" style="display:none;">
+                <div class="tab-toolbar">
+                    <input type="text" class="search-box" id="conn-filter" placeholder="Filter by app or address…" style="width:260px;">
+                    <span class="conn-count" id="conn-count"></span>
+                </div>
+                <div class="table-container">
+                    <table id="conn-table">
+                        <thead>
+                            <tr>
+                                <th style="width:160px;">Application</th>
+                                <th style="width:52px;">PID</th>
+                                <th style="width:52px;">Proto</th>
+                                <th>Local</th>
+                                <th>Remote</th>
+                                <th style="width:110px;">State</th>
+                            </tr>
+                        </thead>
+                        <tbody id="conn-tbody"></tbody>
+                    </table>
+                </div>
             </div>
         </div>
 
@@ -126,6 +154,18 @@
                         <svg width="100%" height="100%" preserveAspectRatio="none" id="svg-detail-up"></svg>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Generic modal dialog (Rules/Quotas add/edit) -->
+    <div id="modal-overlay" style="display:none;">
+        <div class="modal">
+            <div class="modal-title" id="modal-title"></div>
+            <div class="modal-body" id="modal-body"></div>
+            <div class="modal-footer">
+                <button id="modal-cancel" class="modal-btn modal-btn-cancel">Cancel</button>
+                <button id="modal-ok" class="modal-btn modal-btn-ok">Apply</button>
             </div>
         </div>
     </div>

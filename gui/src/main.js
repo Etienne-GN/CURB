@@ -66,6 +66,11 @@ function formatSize(bytes) {
     return bytes.toFixed(0) + " B";
 }
 
+function formatUsage(down, up) {
+    const total = (down || 0) + (up || 0);
+    return total > 0 ? formatSize(total) : '—';
+}
+
 function parseRate(input) {
     if (!input || input === "—" || input === "unlimited" || input === "0") return null;
     const match = input.toLowerCase().match(/^([\d\.]+)\s*(gbit|mbit|kbit|bit|gb|mb|kb|b)?$/);
@@ -733,6 +738,7 @@ function renderHostRoot(tbody) {
         <td><span class="download-text">${formatRate(hostTotals.down_bps)}</span></td>
         <td><span class="upload-text">${formatRate(hostTotals.up_bps)}</span></td>
         <td></td>
+        <td></td>
     `;
     const toggle = () => toggleNode('host');
     tr.querySelector('.tree-toggle').onclick = (e) => { e.stopPropagation(); toggle(); };
@@ -784,6 +790,7 @@ function renderZoneRow(tbody, id, label, downLim, upLim, level, downRate, upRate
         <td><div class="rule-cell"></div></td>
         <td><span class="download-text">${formatRate(downRate || 0)}</span></td>
         <td><span class="upload-text">${formatRate(upRate || 0)}</span></td>
+        <td></td>
         <td></td>
     `;
 
@@ -861,12 +868,13 @@ function renderAppRow(tbody, app, level) {
             </div>
         </td>
         <td>
-            <div class="quota-container">
-                <div class="quota-bar-bg">
-                    <div class="quota-bar-fill ${quotaExceeded ? 'danger' : ''}" style="width: ${quotaPercent}%"></div>
-                </div>
-                <span class="quota-label">${quota ? formatSize(quota.used_bytes) + ' / ' + formatSize(quota.budget_bytes) : '—'}</span>
+            <div class="usage-cell">
+                <span class="usage-value">${formatUsage(app.today_down, app.today_up)}</span>
+                ${quota ? `<div class="quota-container"><div class="quota-bar-bg"><div class="quota-bar-fill ${quotaExceeded ? 'danger' : ''}" style="width: ${quotaPercent}%"></div></div><span class="quota-label">${formatSize(quota.used_bytes)} / ${formatSize(quota.budget_bytes)}</span></div>` : ''}
             </div>
+        </td>
+        <td>
+            <span class="usage-value muted">${formatUsage(app.month_down, app.month_up)}</span>
         </td>
     `;
 
@@ -886,7 +894,8 @@ function renderAppRow(tbody, app, level) {
     };
     ruleCell.append(aDown, aUp);
 
-    tr.querySelector('.quota-container').onclick = (e) => { e.stopPropagation(); promptQuota(app.exe); };
+    const quotaEl = tr.querySelector('.quota-container');
+    if (quotaEl) quotaEl.onclick = (e) => { e.stopPropagation(); promptQuota(app.exe); };
     tr.querySelector('.pin-btn').onclick = (e) => { e.stopPropagation(); togglePin(app.exe); };
 
     tbody.appendChild(tr);

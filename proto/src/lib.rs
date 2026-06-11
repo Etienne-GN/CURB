@@ -326,6 +326,19 @@ pub struct AppStat {
     pub inet_down_bps: u64,
     #[serde(default)]
     pub inet_up_bps: u64,
+    /// Persistent usage counters (from the usage tracker, survive daemon restarts).
+    #[serde(default)]
+    pub today_down: u64,
+    #[serde(default)]
+    pub today_up: u64,
+    #[serde(default)]
+    pub week_down: u64,
+    #[serde(default)]
+    pub week_up: u64,
+    #[serde(default)]
+    pub month_down: u64,
+    #[serde(default)]
+    pub month_up: u64,
 }
 
 /// Aggregate host-wide traffic totals, with a LAN/Internet rate breakdown.

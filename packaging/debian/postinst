@@ -26,6 +26,9 @@ configure)
         echo "    sudo usermod -aG curb \$USER  (then log out/in)"
     fi
 
+    # Create the persistent state directory for usage and quota data.
+    install -d -m 755 -o root -g curb /var/lib/curb
+
     # Enable and start the daemon.
     if command -v systemctl > /dev/null 2>&1 && systemctl is-system-running --quiet 2>/dev/null; then
         systemctl daemon-reload

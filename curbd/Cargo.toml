@@ -21,6 +21,7 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 aya = "0.13"
 
 [[example]]

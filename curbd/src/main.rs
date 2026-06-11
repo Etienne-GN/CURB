@@ -13,6 +13,7 @@ use std::time::Instant;
 mod engine;
 mod monitor;
 mod quota;
+mod usage;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -21,6 +22,7 @@ use curb_proto::{socket_path, DaemonStatus, Request, Response, PROTOCOL_VERSION}
 use engine::Engine;
 use monitor::Monitor;
 use quota::QuotaManager;
+use usage::UsageTracker;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -46,6 +48,8 @@ struct State {
     engine: Option<Engine>,
     /// Per-app quota manager; `Some` only when both monitor and engine exist.
     quota: Option<QuotaManager>,
+    /// Persistent per-app usage tracker (daily/weekly/monthly bytes).
+    usage: Option<UsageTracker>,
 }
 
 impl State {
@@ -126,11 +130,15 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
+    // Usage tracker only needs the monitor (no enforcement capability required).
+    let usage = monitor.as_ref().map(|m| UsageTracker::start(m.clone()));
+
     let state = Arc::new(State {
         started: Instant::now(),
         monitor,
         engine,
         quota,
+        usage,
     });
 
     info!(socket = %path.display(), version = env!("CARGO_PKG_VERSION"), "curbd listening");
@@ -139,6 +147,10 @@ async fn main() -> Result<()> {
     // is tidy.
     let result = serve(&listener, state.clone()).await;
 
+    // Persist usage data before exiting.
+    if let Some(usage) = &state.usage {
+        usage.flush();
+    }
     // Remove all kernel shaping/policing state before exiting.
     if let Some(engine) = &state.engine {
         engine.shutdown();
@@ -209,7 +221,23 @@ fn dispatch(req: Request, state: &State) -> Response {
         Request::Ping => Response::Pong,
         Request::GetStatus => Response::Status(state.status()),
         Request::ListApps => match &state.monitor {
-            Some(m) => Response::Apps(m.snapshot()),
+            Some(m) => {
+                let mut snap = m.snapshot();
+                if let Some(usage) = &state.usage {
+                    let all = usage.get_all();
+                    for app in snap.apps.iter_mut() {
+                        if let Some(u) = all.get(&app.exe) {
+                            app.today_down = u.today_down;
+                            app.today_up = u.today_up;
+                            app.week_down = u.week_down;
+                            app.week_up = u.week_up;
+                            app.month_down = u.month_down;
+                            app.month_up = u.month_up;
+                        }
+                    }
+                }
+                Response::Apps(snap)
+            }
             None => Response::Error {
                 message: "traffic monitor unavailable (curbd needs CAP_NET_RAW; run as root)"
                     .to_string(),

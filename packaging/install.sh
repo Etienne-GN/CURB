@@ -82,16 +82,21 @@ if [ -f "$DESKTOP_FILE" ] && [ -f /usr/local/bin/curb-gui ]; then
     info "Installed desktop launcher."
 fi
 
-# ── 7. Install systemd unit ───────────────────────────────────────────────────
+# ── 7. Create persistent state directory ─────────────────────────────────────
+install -d -m 755 /var/lib/curb
+chown root:curb /var/lib/curb 2>/dev/null || true
+info "State directory: /var/lib/curb"
+
+# ── 8. Install systemd unit ───────────────────────────────────────────────────
 install -Dm644 "$REPO_ROOT/packaging/curbd.service" /etc/systemd/system/curbd.service
 info "Installed /etc/systemd/system/curbd.service."
 
-# ── 8. Enable and start the daemon ───────────────────────────────────────────
+# ── 9. Enable and start the daemon ───────────────────────────────────────────
 systemctl daemon-reload
 systemctl enable --now curbd
 info "curbd is enabled and running."
 
-# ── 9. Verify ────────────────────────────────────────────────────────────────
+# ── 10. Verify ────────────────────────────────────────────────────────────────
 sleep 0.5
 if /usr/local/bin/curb ping &>/dev/null; then
     info "✓ curb ping succeeded — installation complete."

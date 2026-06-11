@@ -376,6 +376,12 @@ impl Inner {
                 lan_up_bps,
                 inet_down_bps,
                 inet_up_bps,
+                today_down: 0,
+                today_up: 0,
+                week_down: 0,
+                week_up: 0,
+                month_down: 0,
+                month_up: 0,
             });
         }
         for k in evict {

@@ -94,6 +94,11 @@ pub enum Request {
     ListQuotas,
     /// List all active TCP/UDP connections attributed to their owning app.
     ListConnections,
+    /// List available network interfaces (for the interface selector in Settings).
+    ListInterfaces,
+    /// Persist an interface preference to the daemon config file.
+    /// Takes effect on the next daemon restart.
+    SetInterface { name: String },
 }
 
 /// The daemon's reply to a [`Request`].
@@ -113,6 +118,8 @@ pub enum Response {
     Quotas(Vec<QuotaStatus>),
     /// Reply to [`Request::ListConnections`].
     Connections(Vec<ConnectionInfo>),
+    /// Reply to [`Request::ListInterfaces`].
+    Interfaces(Vec<InterfaceInfo>),
     /// Generic success for requests with no payload.
     Ok,
     /// The request could not be served.
@@ -194,6 +201,17 @@ pub struct QuotaStatus {
     pub exceeded: bool,
     /// Seconds until the period resets (`None` for [`QuotaPeriod::Total`]).
     pub resets_in_secs: Option<u64>,
+}
+
+/// A network interface visible to the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceInfo {
+    /// Interface name, e.g. `"wlp0s20f3"`.
+    pub name: String,
+    /// Whether the interface reports `operstate = up`.
+    pub is_up: bool,
+    /// Whether this is the interface the daemon is currently shaping on.
+    pub is_active: bool,
 }
 
 /// An individual TCP/UDP connection attributed to an application.

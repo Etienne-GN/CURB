@@ -8,8 +8,8 @@
 //! the single source of truth.
 
 use curb_proto::{
-    AppLimit, Client, ConnectionInfo, Direction, LimiterState, MonitorSnapshot, QuotaPeriod,
-    QuotaStatus, Request, Response, Scope,
+    AppLimit, Client, ConnectionInfo, DaemonStatus, Direction, InterfaceInfo, LimiterState,
+    MonitorSnapshot, QuotaPeriod, QuotaStatus, Request, Response, Scope,
 };
 
 /// Connect to the daemon at the resolved socket path (`$CURB_SOCK` or default).
@@ -52,6 +52,36 @@ fn parse_period(s: &str) -> QuotaPeriod {
 }
 
 // ---- Read commands --------------------------------------------------------
+
+/// Daemon status including version string.
+#[tauri::command]
+async fn get_status() -> Result<DaemonStatus, String> {
+    match call(Request::GetStatus).await? {
+        Response::Status(s) => Ok(s),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Available network interfaces.
+#[tauri::command]
+async fn list_interfaces() -> Result<Vec<InterfaceInfo>, String> {
+    match call(Request::ListInterfaces).await? {
+        Response::Interfaces(v) => Ok(v),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Persist the preferred shaping interface (takes effect on daemon restart).
+#[tauri::command]
+async fn set_interface(name: String) -> Result<(), String> {
+    match call(Request::SetInterface { name }).await? {
+        Response::Ok => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
 
 /// Live per-application traffic snapshot (polled by the frontend).
 #[tauri::command]
@@ -212,11 +242,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            get_status,
             list_apps,
             get_limiter,
             list_app_limits,
             list_quotas,
             list_connections,
+            list_interfaces,
+            set_interface,
             set_host_limit,
             set_limiter_enabled,
             set_app_limit,

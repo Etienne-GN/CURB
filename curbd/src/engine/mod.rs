@@ -102,8 +102,18 @@ impl Engine {
     /// Detect the egress interface, create an idle engine, and start the
     /// per-app membership reconciler. No kernel changes are made until a limit
     /// is applied.
+    #[allow(dead_code)]
     pub fn new() -> Result<Self> {
-        let iface = tc::default_interface().context("detecting default interface")?;
+        Self::new_on(None)
+    }
+
+    /// Start the engine, using `preferred_iface` if set (falls back to the
+    /// default route interface when `None`).
+    pub fn new_on(preferred_iface: Option<&str>) -> Result<Self> {
+        let iface = match preferred_iface {
+            Some(i) => i.to_string(),
+            None => tc::default_interface().context("detecting default interface")?,
+        };
         info!(interface = %iface, "shaping engine bound to interface");
 
         // Try to load the eBPF egress classifier for smooth per-app upload
@@ -200,6 +210,11 @@ impl Engine {
     /// Whether shaping is currently enabled.
     pub fn enabled(&self) -> bool {
         self.inner.state.lock().unwrap().enabled
+    }
+
+    /// The interface this engine is bound to.
+    pub fn interface(&self) -> String {
+        self.inner.iface.clone()
     }
 
     // ---- Host-wide caps (P2) ----------------------------------------------

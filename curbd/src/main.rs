@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod config;
 mod engine;
 mod monitor;
 mod quota;
@@ -113,9 +114,12 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Load persistent daemon config (interface preference, etc.).
+    let daemon_cfg = config::load();
+
     // Initialize the shaping engine (detects the default interface; applies no
     // kernel changes until a limit is set).
-    let engine = match Engine::new() {
+    let engine = match Engine::new_on(daemon_cfg.interface.as_deref()) {
         Ok(e) => Some(e),
         Err(e) => {
             warn!(error = %e, "shaping engine unavailable (no default route?)");
@@ -334,7 +338,39 @@ fn dispatch(req: Request, state: &State) -> Response {
             Some(e) => Response::Connections(e.list_connections()),
             None => Response::Connections(Vec::new()),
         },
+        Request::ListInterfaces => {
+            let active = state.engine.as_ref().map(|e| e.interface()).unwrap_or_default();
+            Response::Interfaces(list_interfaces(&active))
+        }
+        Request::SetInterface { name } => {
+            config::save_interface(&name);
+            info!(interface = %name, "interface preference saved; restart daemon to apply");
+            Response::Ok
+        }
     }
+}
+
+/// Enumerate non-loopback interfaces from `/proc/net/dev`.
+fn list_interfaces(active: &str) -> Vec<curb_proto::InterfaceInfo> {
+    let mut out = Vec::new();
+    let Ok(content) = std::fs::read_to_string("/proc/net/dev") else {
+        return out;
+    };
+    for line in content.lines().skip(2) {
+        let name = line.trim().split(':').next().unwrap_or("").trim();
+        if name.is_empty() || name == "lo" {
+            continue;
+        }
+        let operstate = std::fs::read_to_string(format!("/sys/class/net/{name}/operstate"))
+            .unwrap_or_default();
+        out.push(curb_proto::InterfaceInfo {
+            name: name.to_string(),
+            is_up: operstate.trim() == "up",
+            is_active: name == active,
+        });
+    }
+    out.sort_by(|a, b| b.is_up.cmp(&a.is_up).then(a.name.cmp(&b.name)));
+    out
 }
 
 fn quota_unavailable() -> Response {

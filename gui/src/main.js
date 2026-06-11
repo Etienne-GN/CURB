@@ -290,7 +290,7 @@ function renderUI() {
         else if (v === 'Rules')        renderRules();
         else if (v === 'Quotas')       renderQuotas();
         else if (v === 'Connections')  renderConnections();
-        else if (v === 'Settings')     renderSettings();
+        else if (v === 'Settings')     loadSettingsData();
     }
     renderDetailStrip();
 }
@@ -1724,6 +1724,21 @@ function parseCustomTheme() {
     } catch { return null; }
 }
 
+let daemonStatus = null;
+let availableInterfaces = [];
+
+async function loadSettingsData() {
+    try {
+        const [status, ifaces] = await Promise.all([
+            invoke('get_status'),
+            invoke('list_interfaces'),
+        ]);
+        daemonStatus = status;
+        availableInterfaces = ifaces;
+    } catch (_) {}
+    renderSettings();
+}
+
 function renderSettings() {
     const view = document.getElementById('settings-view');
 
@@ -1747,6 +1762,16 @@ function renderSettings() {
     }).join('');
 
     const customRaw = localStorage.getItem('curb-custom-theme') || '';
+    const ifaceCards = availableInterfaces.map(i => {
+        const cls = i.is_active ? 'iface-card iface-card-active' : 'iface-card';
+        const dot = i.is_up ? 'iface-dot iface-dot-up' : 'iface-dot iface-dot-down';
+        return `<div class="${cls}" data-iface="${escHtml(i.name)}">
+            <span class="${dot}"></span>
+            <span class="iface-name">${escHtml(i.name)}</span>
+            ${i.is_active ? '<span class="iface-badge">active</span>' : ''}
+        </div>`;
+    }).join('');
+
     view.innerHTML = `
         <div class="settings-scroll">
             <section class="settings-section">
@@ -1773,6 +1798,27 @@ function renderSettings() {
                     <span id="custom-theme-error" class="custom-theme-err"></span>
                 </div>
             </section>
+
+            <section class="settings-section">
+                <div class="settings-section-title">Network Interface</div>
+                <p class="settings-hint">Select the interface CURB shapes traffic on. Changes take effect after restarting the daemon (<code>sudo systemctl restart curbd</code>).</p>
+                <div class="iface-grid" id="iface-grid">${ifaceCards || '<span style="color:var(--text-muted)">No interfaces found</span>'}</div>
+                <div id="iface-restart-notice" class="settings-notice" style="display:none">
+                    Interface saved. Run <code>sudo systemctl restart curbd</code> to apply.
+                </div>
+            </section>
+
+            <section class="settings-section">
+                <div class="settings-section-title">About</div>
+                <div class="about-grid">
+                    <span class="about-label">CURB version</span>
+                    <span class="about-value">${daemonStatus ? escHtml(daemonStatus.daemon_version) : '—'}</span>
+                    <span class="about-label">Daemon PID</span>
+                    <span class="about-value">${daemonStatus ? daemonStatus.pid : '—'}</span>
+                    <span class="about-label">Uptime</span>
+                    <span class="about-value">${daemonStatus ? formatUptime(daemonStatus.uptime_secs) : '—'}</span>
+                </div>
+            </section>
         </div>
     `;
 
@@ -1782,6 +1828,38 @@ function renderSettings() {
     });
     document.getElementById('apply-custom-theme-btn').onclick = applyCustomTheme;
     document.getElementById('clear-custom-theme-btn').onclick = clearCustomTheme;
+
+    document.getElementById('iface-grid').addEventListener('click', async (e) => {
+        const card = e.target.closest('[data-iface]');
+        if (!card) return;
+        const name = card.dataset.iface;
+        try {
+            await invoke('set_interface', { name });
+            // Update local state so the card highlights immediately.
+            availableInterfaces = availableInterfaces.map(i => ({ ...i, is_active: i.name === name }));
+            document.getElementById('iface-restart-notice').style.display = '';
+            // Re-render just the iface grid.
+            document.getElementById('iface-grid').innerHTML = availableInterfaces.map(i => {
+                const cls = i.is_active ? 'iface-card iface-card-active' : 'iface-card';
+                const dot = i.is_up ? 'iface-dot iface-dot-up' : 'iface-dot iface-dot-down';
+                return `<div class="${cls}" data-iface="${escHtml(i.name)}">
+                    <span class="${dot}"></span>
+                    <span class="iface-name">${escHtml(i.name)}</span>
+                    ${i.is_active ? '<span class="iface-badge">active</span>' : ''}
+                </div>`;
+            }).join('');
+        } catch (err) {
+            console.error('set_interface failed:', err);
+        }
+    });
+}
+
+function formatUptime(secs) {
+    if (secs < 60) return `${secs}s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    return `${h}h ${m}m`;
 }
 
 function applyCustomTheme() {

@@ -14,12 +14,13 @@
 mod cgroup;
 mod ebpf;
 mod nft;
+mod proc_connector;
 mod tc;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use curb_proto::{AppLimit, HostLimit, LimiterState, Scope};
@@ -28,8 +29,11 @@ use tracing::{info, warn};
 
 /// Dedicated IFB device name for ingress shaping (≤15 chars).
 const IFB_DEV: &str = "ifbcurb";
-/// How often app cgroup membership is reconciled against running processes.
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+/// Fallback polling interval when proc-connector is active (belt-and-suspenders
+/// full scan to catch anything the connector missed).
+const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+/// Polling interval when proc-connector is unavailable.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// First HTB class minor assigned to per-app egress classes (1:10, 1:11, …).
 const FIRST_MINOR: u16 = 0x10;
 
@@ -138,17 +142,49 @@ impl Engine {
             iface,
         });
 
-        // Reconciler: keep app cgroups populated with their processes.
+        // Reconciler: place new processes in their cgroup as fast as possible.
+        // Tries the kernel's cn_proc Netlink connector first (millisecond
+        // latency); falls back to 1-second polling if unavailable.
         {
             let inner = inner.clone();
             std::thread::Builder::new()
                 .name("curb-reconcile".into())
-                .spawn(move || loop {
-                    std::thread::sleep(RECONCILE_INTERVAL);
-                    reconcile_membership(&inner);
-                    // Keep existing/long-lived connections classified (the eBPF
-                    // flow map is LRU, and apps open new connections over time).
-                    seed_existing_flows(&inner);
+                .spawn(move || {
+                    match proc_connector::spawn() {
+                        Some(rx) => {
+                            info!("proc-connector active — new processes placed within milliseconds");
+                            let mut last_full = Instant::now();
+                            loop {
+                                // Block until an exec event arrives, waking at
+                                // most every FULL_SCAN_INTERVAL for a belt-and-
+                                // suspenders full scan.
+                                match rx.recv_timeout(FULL_SCAN_INTERVAL) {
+                                    Ok(pid) => {
+                                        reconcile_one(&inner, pid);
+                                        // Drain any burst of events without blocking.
+                                        while let Ok(p) = rx.try_recv() {
+                                            reconcile_one(&inner, p);
+                                        }
+                                    }
+                                    Err(_) => {} // timeout — fall through to full scan
+                                }
+                                if last_full.elapsed() >= FULL_SCAN_INTERVAL {
+                                    reconcile_membership(&inner);
+                                    seed_existing_flows(&inner);
+                                    last_full = Instant::now();
+                                }
+                            }
+                        }
+                        None => {
+                            warn!("proc-connector unavailable — using {}s polling for process tracking",
+                                  POLL_INTERVAL.as_secs());
+                            loop {
+                                std::thread::sleep(POLL_INTERVAL);
+                                reconcile_membership(&inner);
+                                seed_existing_flows(&inner);
+                            }
+                        }
+                    }
                 })
                 .ok();
         }
@@ -588,6 +624,19 @@ impl EngineInner {
             return Ok(());
         }
         nft::apply(&rules).context("applying nft per-app rules")
+    }
+}
+
+/// Place a single PID into its app cgroup, if it belongs to a tracked app.
+/// Called immediately on every PROC_EVENT_EXEC from proc-connector.
+fn reconcile_one(inner: &EngineInner, pid: u32) {
+    let exe = read_exe(pid);
+    if exe.is_empty() {
+        return;
+    }
+    let apps = inner.apps.lock().unwrap();
+    if let Some(r) = apps.get(&exe) {
+        cgroup::add_pid(&r.dir, pid);
     }
 }
 

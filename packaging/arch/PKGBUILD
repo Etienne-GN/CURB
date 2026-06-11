@@ -1,0 +1,41 @@
+# Maintainer: Etienne Gagné-Nadeau <etienne.gagnenadeau@gmail.com>
+pkgname=curb
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Per-application bandwidth control for Linux (NetLimiter equivalent)"
+arch=('x86_64')
+url="https://github.com/Etienne-GN/CURB"
+license=('MIT')
+depends=('glibc')
+makedepends=('rust' 'cargo' 'clang' 'llvm')
+optdepends=('webkit2gtk-4.1: graphical interface (curb-gui)')
+backup=()
+install=curb.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # Replace with real checksum for release
+
+build() {
+    cd "$srcdir/CURB-$pkgver"
+    cargo build --release -p curbd -p curb
+    # GUI (optional — requires webkit2gtk-4.1 at build time)
+    # cd gui && npm install && cargo tauri build --release
+}
+
+package() {
+    cd "$srcdir/CURB-$pkgver"
+
+    install -Dm755 target/release/curbd "$pkgdir/usr/bin/curbd"
+    install -Dm755 target/release/curb  "$pkgdir/usr/bin/curb"
+
+    install -Dm644 packaging/curbd.service \
+        "$pkgdir/usr/lib/systemd/system/curbd.service"
+
+    # Desktop file and GUI (if built)
+    if [ -f gui/src-tauri/target/release/gui ]; then
+        install -Dm755 gui/src-tauri/target/release/gui "$pkgdir/usr/bin/curb-gui"
+        install -Dm644 packaging/curb-gui.desktop \
+            "$pkgdir/usr/share/applications/curb-gui.desktop"
+    fi
+
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

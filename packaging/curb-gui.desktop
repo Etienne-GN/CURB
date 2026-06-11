@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=CURB
+GenericName=Bandwidth Monitor
+Comment=Per-application network bandwidth control
+Exec=curb-gui
+Icon=curb
+Terminal=false
+Type=Application
+Categories=Network;Monitor;System;
+Keywords=network;bandwidth;monitor;limit;traffic;
+StartupNotify=true

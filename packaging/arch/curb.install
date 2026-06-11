@@ -1,0 +1,24 @@
+post_install() {
+    # Create the curb system group
+    if ! getent group curb > /dev/null 2>&1; then
+        groupadd --system curb
+    fi
+
+    systemctl daemon-reload
+    systemctl enable --now curbd.service
+
+    echo ""
+    echo "CURB installed. To allow a non-root user to control the daemon:"
+    echo "  sudo usermod -aG curb \$USER"
+    echo "Then log out and back in (or: newgrp curb)."
+}
+
+post_upgrade() {
+    systemctl daemon-reload
+    systemctl restart curbd.service
+}
+
+pre_remove() {
+    systemctl stop curbd.service 2>/dev/null || true
+    systemctl disable curbd.service 2>/dev/null || true
+}

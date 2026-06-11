@@ -1,15 +1,18 @@
-# Rust
+# Rust build output
 /target
 **/*.rs.bk
 Cargo.lock.orig
 
-# eBPF build artifacts (later phases)
+# eBPF
 /bpf/target
+# The compiled .bpf.o is checked in so the repo builds without clang being present
+# at build time. Regenerate with: cd curbd && cargo build (requires clang).
 
-# Tauri / GUI (later phases)
+# Tauri / GUI
 /gui/node_modules
 /gui/dist
 /gui/src-tauri/target
+/gui/src-tauri/gen/schemas
 
 # Editor / OS
 .DS_Store
@@ -17,6 +20,9 @@ Cargo.lock.orig
 .idea/
 .vscode/
 
-# Local dev socket / state
+# Local dev socket / runtime state
 /run/
 *.sock
+
+# Temp icon processing artifacts
+icon_padded.png

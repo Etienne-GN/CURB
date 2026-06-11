@@ -1,0 +1,23 @@
+Package: curb
+Version: 0.1.0
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: libc6 (>= 2.31)
+Recommends: curb-gui
+Maintainer: Etienne Gagné-Nadeau <etienne.gagnenadeau@gmail.com>
+Homepage: https://github.com/Etienne-GN/CURB
+Description: Per-application bandwidth control for Linux
+ CURB (Connection Usage & Rate Balancer) is a NetLimiter-equivalent for
+ Linux. It monitors and limits network bandwidth on a per-application basis
+ using eBPF, tc/HTB, and cgroups v2.
+ .
+ Features:
+  * Live per-application upload/download rates
+  * Per-app bandwidth limits (LAN and/or Internet)
+  * Host-wide caps
+  * Per-app data quotas (daily/weekly/monthly)
+  * Active connection viewer
+ .
+ Requires Linux kernel >= 5.10 with BTF and CAP_NET_ADMIN (runs as a
+ systemd service).

@@ -21,11 +21,35 @@ let selectedExe = null;
 let searchQuery = "";
 let connFilter = "";
 let hostDownHistory = Array(60).fill(0);
-let hostUpHistory = Array(60).fill(0);
+let hostUpHistory   = Array(60).fill(0);
+let lanDownHistory  = Array(60).fill(0);
+let lanUpHistory    = Array(60).fill(0);
+let inetDownHistory = Array(60).fill(0);
+let inetUpHistory   = Array(60).fill(0);
 let expandedNodes = new Set(['host', 'lan', 'internet']); // all expanded by default
 let currentView = 'Dashboard';
+let pinnedApps = JSON.parse(localStorage.getItem('curb-pinned') || '[]');
+let dashGrid = null;
+let dashEditing = false;
+let dashActiveWidgets = [];
 
 // --- Helpers ---
+
+const APP_COLORS = ['#38bdf8','#fb923c','#34d399','#f472b6','#a78bfa','#fbbf24','#60a5fa','#4ade80','#f87171','#2dd4bf','#e879f9','#fb7185'];
+function appColor(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = Math.imul(31, h) + str.charCodeAt(i) | 0;
+    return APP_COLORS[Math.abs(h) % APP_COLORS.length];
+}
+
+function togglePin(exe) {
+    const idx = pinnedApps.indexOf(exe);
+    if (idx === -1) pinnedApps.push(exe);
+    else pinnedApps.splice(idx, 1);
+    localStorage.setItem('curb-pinned', JSON.stringify(pinnedApps));
+    renderTable();
+    if (currentView === 'Dashboard') initPinnedBars();
+}
 
 function formatRate(bps) {
     if (bps === null || bps === undefined) return "—";
@@ -96,22 +120,29 @@ function createSparkline(svg, data, color, width = 40, height = 14) {
 
 function createAreaGraph(svg, data, color) {
     if (!svg) return;
-    const width = 1000;
-    const height = 100;
-    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-    const max = Math.max(...data, 1);
-    const points = data.map((d, i) => {
-        const x = (i / (data.length - 1)) * width;
-        const y = height - (d / max) * height;
+    const W = 1000, H = 100;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+    // Need ≥ 2 points to draw a line; pad to 60 when data is still accumulating.
+    const d = data.length >= 2 ? data : Array(60).fill(0);
+
+    const max = Math.max(...d, 1);
+    // Reserve 3px at the bottom so the zero-traffic baseline is always visible
+    // (without this, all-zero data places every point at y=H and gets clipped).
+    const usableH = H - 3;
+
+    const pts = d.map((v, i) => {
+        const x = ((i / (d.length - 1)) * W).toFixed(1);
+        const y = (usableH - (v / max) * usableH).toFixed(1);
         return `${x},${y}`;
     });
 
-    const polylinePoints = points.join(" ");
-    const areaPoints = `0,${height} ${polylinePoints} ${width},${height}`;
+    const line = pts.join(' ');
+    const area = `0,${H} ${line} ${W},${H}`;
 
     svg.innerHTML = `
-        <polygon points="${areaPoints}" fill="${color}" class="area-fill" />
-        <polyline points="${polylinePoints}" stroke="${color}" />
+        <polygon points="${area}" fill="${color}" class="area-fill"/>
+        <polyline points="${line}" stroke="${color}"/>
     `;
 }
 
@@ -154,10 +185,12 @@ async function poll() {
         if (fetchConns) connections = conns;
 
         // Update host history
-        hostDownHistory.push(hostTotals.down_bps);
-        hostDownHistory.shift();
-        hostUpHistory.push(hostTotals.up_bps);
-        hostUpHistory.shift();
+        hostDownHistory.push(hostTotals.down_bps); hostDownHistory.shift();
+        hostUpHistory.push(hostTotals.up_bps);     hostUpHistory.shift();
+        lanDownHistory.push(hostTotals.lan_down_bps || 0); lanDownHistory.shift();
+        lanUpHistory.push(hostTotals.lan_up_bps   || 0);   lanUpHistory.shift();
+        inetDownHistory.push(hostTotals.inet_down_bps || 0); inetDownHistory.shift();
+        inetUpHistory.push(hostTotals.inet_up_bps   || 0);   inetUpHistory.shift();
 
         document.getElementById('error-banner').style.display = 'none';
         renderUI();
@@ -239,6 +272,7 @@ function renderUI() {
     document.getElementById('rules-view').style.display        = v === 'Rules'        ? ''     : 'none';
     document.getElementById('quotas-view').style.display       = v === 'Quotas'       ? ''     : 'none';
     document.getElementById('connections-view').style.display  = v === 'Connections'  ? ''     : 'none';
+    document.getElementById('settings-view').style.display     = v === 'Settings'     ? ''     : 'none';
 
     if (!popupOpen) {
         if      (v === 'Dashboard')    renderDashboard();
@@ -246,74 +280,365 @@ function renderUI() {
         else if (v === 'Rules')        renderRules();
         else if (v === 'Quotas')       renderQuotas();
         else if (v === 'Connections')  renderConnections();
+        else if (v === 'Settings')     renderSettings();
     }
     renderDetailStrip();
 }
 
-function renderDashboard() {
-    const dash = document.getElementById('dashboard-view');
-    const topApps = [...apps]
-        .sort((a, b) => (b.down_bps + b.up_bps) - (a.down_bps + a.up_bps))
-        .slice(0, 6);
+// ── Dashboard widget system ────────────────────────────────────────────────
 
-    dash.innerHTML = `
-        <div class="dash-row">
-            <div class="dash-card">
-                <div class="dash-label">↓ Download</div>
-                <div class="dash-big download-text">${formatRate(hostTotals.down_bps)}</div>
-                <svg class="dash-spark" id="dsp-down"></svg>
-                <div class="dash-sub">${formatSize(hostTotals.down_total)} total since start</div>
-            </div>
-            <div class="dash-card">
-                <div class="dash-label">↑ Upload</div>
-                <div class="dash-big upload-text">${formatRate(hostTotals.up_bps)}</div>
-                <svg class="dash-spark" id="dsp-up"></svg>
-                <div class="dash-sub">${formatSize(hostTotals.up_total)} total since start</div>
-            </div>
-            <div class="dash-card">
-                <div class="dash-label">Limiter</div>
-                <div class="dash-limiter-status" style="color:${limiterState.enabled ? 'var(--brand)' : 'var(--text-muted)'}">
-                    ${limiterState.enabled ? 'ON' : 'OFF'}
+function topAppsHtml() {
+    const top = [...apps].sort((a, b) => (b.down_bps + b.up_bps) - (a.down_bps + a.up_bps)).slice(0, 5);
+    if (top.length === 0) return `<div class="dash-label">Top Applications</div><div class="dash-sub" style="margin-top:14px;">No traffic observed yet.</div>`;
+    return `<div class="dash-label">Top Applications</div>
+        <div class="dash-app-list">${top.map(a => `
+            <div class="dash-app-row">
+                <div class="dash-app-icon" style="border-top-color:${appColor(a.exe)}">${escHtml(a.name[0].toUpperCase())}</div>
+                <span class="dash-app-name">${escHtml(a.name)}</span>
+                <div class="dash-app-rates">
+                    <span class="download-text">↓ ${formatRate(a.down_bps)}</span>
+                    <span class="upload-text">↑ ${formatRate(a.up_bps)}</span>
                 </div>
-                <div class="dash-iface">${limiterState.interface || '—'}</div>
+            </div>`).join('')}
+        </div>`;
+}
+
+const WIDGET_DEFS = {
+    download: {
+        title: 'Download', defaultPos: { x: 0, y: 0, w: 4, h: 4 },
+        html: () => `<div class="dash-label">↓ Download</div>
+            <div class="dash-big download-text" id="wd-dv">${formatRate(hostTotals.down_bps)}</div>
+            <svg class="dash-spark" id="wd-ds"></svg>
+            <div class="dash-sub" id="wd-dt">${formatSize(hostTotals.down_total)} total since start</div>`,
+        tick() {
+            const v = document.getElementById('wd-dv'); if (!v) return;
+            v.textContent = formatRate(hostTotals.down_bps);
+            document.getElementById('wd-dt').textContent = formatSize(hostTotals.down_total) + ' total since start';
+            createSparkline(document.getElementById('wd-ds'), hostDownHistory, 'var(--download)', 200, 40);
+        }
+    },
+    upload: {
+        title: 'Upload', defaultPos: { x: 4, y: 0, w: 4, h: 4 },
+        html: () => `<div class="dash-label">↑ Upload</div>
+            <div class="dash-big upload-text" id="wd-uv">${formatRate(hostTotals.up_bps)}</div>
+            <svg class="dash-spark" id="wd-us"></svg>
+            <div class="dash-sub" id="wd-ut">${formatSize(hostTotals.up_total)} total since start</div>`,
+        tick() {
+            const v = document.getElementById('wd-uv'); if (!v) return;
+            v.textContent = formatRate(hostTotals.up_bps);
+            document.getElementById('wd-ut').textContent = formatSize(hostTotals.up_total) + ' total since start';
+            createSparkline(document.getElementById('wd-us'), hostUpHistory, 'var(--upload)', 200, 40);
+        }
+    },
+    limiter: {
+        title: 'Limiter Status', defaultPos: { x: 8, y: 0, w: 4, h: 4 },
+        html: () => `<div class="dash-label">Limiter</div>
+            <div class="dash-limiter-status" id="wd-ls" style="color:${limiterState.enabled ? 'var(--brand)' : 'var(--text-muted)'}">
+                ${limiterState.enabled ? 'ON' : 'OFF'}</div>
+            <div class="dash-iface" id="wd-li">${escHtml(limiterState.interface || '—')}</div>`,
+        tick() {
+            const s = document.getElementById('wd-ls'); if (!s) return;
+            s.textContent = limiterState.enabled ? 'ON' : 'OFF';
+            s.style.color = limiterState.enabled ? 'var(--brand)' : 'var(--text-muted)';
+            document.getElementById('wd-li').textContent = limiterState.interface || '—';
+        }
+    },
+    lan: {
+        title: 'Local Network', defaultPos: { x: 0, y: 4, w: 4, h: 4 },
+        html: () => `<div class="dash-label">Local Network</div>
+            <div class="dash-zone-rates">
+                <div class="dash-zone-row">
+                    <span class="dash-zone-arrow download-text">↓</span>
+                    <span class="dash-zone-val download-text" id="wd-lnd">${formatRate(hostTotals.lan_down_bps || 0)}</span>
+                    <svg class="dash-spark dash-zone-spark" id="wd-lds"></svg>
+                </div>
+                <div class="dash-zone-row">
+                    <span class="dash-zone-arrow upload-text">↑</span>
+                    <span class="dash-zone-val upload-text" id="wd-lnu">${formatRate(hostTotals.lan_up_bps || 0)}</span>
+                    <svg class="dash-spark dash-zone-spark" id="wd-lus"></svg>
+                </div>
+            </div>`,
+        tick() {
+            const v = document.getElementById('wd-lnd'); if (!v) return;
+            v.textContent = formatRate(hostTotals.lan_down_bps || 0);
+            document.getElementById('wd-lnu').textContent = formatRate(hostTotals.lan_up_bps || 0);
+            createSparkline(document.getElementById('wd-lds'), lanDownHistory, 'var(--download)', 120, 22);
+            createSparkline(document.getElementById('wd-lus'), lanUpHistory, 'var(--upload)', 120, 22);
+        }
+    },
+    internet: {
+        title: 'Internet', defaultPos: { x: 4, y: 4, w: 4, h: 4 },
+        html: () => `<div class="dash-label">Internet</div>
+            <div class="dash-zone-rates">
+                <div class="dash-zone-row">
+                    <span class="dash-zone-arrow download-text">↓</span>
+                    <span class="dash-zone-val download-text" id="wd-ind">${formatRate(hostTotals.inet_down_bps || 0)}</span>
+                    <svg class="dash-spark dash-zone-spark" id="wd-ids"></svg>
+                </div>
+                <div class="dash-zone-row">
+                    <span class="dash-zone-arrow upload-text">↑</span>
+                    <span class="dash-zone-val upload-text" id="wd-inu">${formatRate(hostTotals.inet_up_bps || 0)}</span>
+                    <svg class="dash-spark dash-zone-spark" id="wd-ius"></svg>
+                </div>
+            </div>`,
+        tick() {
+            const v = document.getElementById('wd-ind'); if (!v) return;
+            v.textContent = formatRate(hostTotals.inet_down_bps || 0);
+            document.getElementById('wd-inu').textContent = formatRate(hostTotals.inet_up_bps || 0);
+            createSparkline(document.getElementById('wd-ids'), inetDownHistory, 'var(--download)', 120, 22);
+            createSparkline(document.getElementById('wd-ius'), inetUpHistory, 'var(--upload)', 120, 22);
+        }
+    },
+    topapps: {
+        title: 'Top Applications', defaultPos: { x: 8, y: 4, w: 4, h: 4 },
+        html: () => topAppsHtml(),
+        tick() {
+            const el = document.getElementById('wgt-topapps'); if (!el) return;
+            el.innerHTML = topAppsHtml();
+        }
+    },
+};
+
+const DEFAULT_LAYOUT = [
+    { id: 'download', x: 0, y: 0, w: 4, h: 4 },
+    { id: 'upload',   x: 4, y: 0, w: 4, h: 4 },
+    { id: 'limiter',  x: 8, y: 0, w: 4, h: 4 },
+    { id: 'lan',      x: 0, y: 4, w: 4, h: 4 },
+    { id: 'internet', x: 4, y: 4, w: 4, h: 4 },
+    { id: 'topapps',  x: 8, y: 4, w: 4, h: 4 },
+];
+
+function setupDashboard() {
+    const container = document.getElementById('dashboard-view');
+    container.innerHTML = `
+        <div id="dash-pinned-zone"></div>
+        <div class="dash-edit-bar" id="dash-edit-bar">
+            <div style="position:relative;" id="dash-add-wrap">
+                <button class="dash-ctrl-btn" id="dash-add-btn">+ Add Widget</button>
+                <div class="dash-add-menu" id="dash-add-menu" style="display:none;"></div>
             </div>
+            <button class="dash-ctrl-btn dash-ctrl-primary" id="dash-save-btn">Save Layout</button>
+            <button class="dash-ctrl-btn" id="dash-cancel-btn">Cancel</button>
+            <button class="dash-ctrl-btn" id="dash-edit-toggle">Edit Dashboard</button>
         </div>
-        <div class="dash-row">
-            <div class="dash-card">
-                <div class="dash-label">Local Network</div>
-                <div class="dash-zone-rates">
-                    <span class="download-text">↓ ${formatRate(hostTotals.lan_down_bps || 0)}</span>
-                    <span class="upload-text">↑ ${formatRate(hostTotals.lan_up_bps || 0)}</span>
-                </div>
-            </div>
-            <div class="dash-card">
-                <div class="dash-label">Internet</div>
-                <div class="dash-zone-rates">
-                    <span class="download-text">↓ ${formatRate(hostTotals.inet_down_bps || 0)}</span>
-                    <span class="upload-text">↑ ${formatRate(hostTotals.inet_up_bps || 0)}</span>
-                </div>
-            </div>
-            <div class="dash-card dash-card-wide">
-                <div class="dash-label">Top Applications</div>
-                <div class="dash-app-list">
-                    ${topApps.length === 0
-                        ? '<div class="dash-sub">No traffic observed yet.</div>'
-                        : topApps.map(a => `
-                            <div class="dash-app-row">
-                                <div class="dash-app-icon">${a.name[0].toUpperCase()}</div>
-                                <span class="dash-app-name">${a.name}</span>
-                                <div class="dash-app-rates">
-                                    <span class="download-text">↓ ${formatRate(a.down_bps)}</span>
-                                    <span class="upload-text">↑ ${formatRate(a.up_bps)}</span>
-                                </div>
-                            </div>`).join('')}
-                </div>
-            </div>
-        </div>
+        <div class="grid-stack" id="dash-grid"></div>
     `;
 
-    createSparkline(document.getElementById('dsp-down'), hostDownHistory, 'var(--download)', 120, 32);
-    createSparkline(document.getElementById('dsp-up'),   hostUpHistory,   'var(--upload)',   120, 32);
+    dashGrid = GridStack.init({
+        column: 12,
+        cellHeight: 50,
+        margin: 8,
+        float: false,
+        staticGrid: true,
+        draggable: { handle: '.gs-drag-handle' },
+        resizable: { handles: 'se,s,e' },
+    }, '#dash-grid');
+
+    const saved = localStorage.getItem('curb-dash-layout');
+    const layout = saved ? JSON.parse(saved) : DEFAULT_LAYOUT;
+    dashActiveWidgets = [];
+    for (const item of layout) {
+        if (!WIDGET_DEFS[item.id]) continue;
+        addDashWidget(item);
+        dashActiveWidgets.push(item.id);
+    }
+
+    setDashEditMode(false);
+
+    document.getElementById('dash-edit-toggle').onclick = () => setDashEditMode(true);
+    document.getElementById('dash-save-btn').onclick = saveDashLayout;
+    document.getElementById('dash-cancel-btn').onclick = cancelDashEdit;
+    document.getElementById('dash-add-btn').onclick = (e) => {
+        e.stopPropagation();
+        const m = document.getElementById('dash-add-menu');
+        const open = m.style.display !== 'none';
+        m.style.display = open ? 'none' : 'block';
+        if (!open) buildAddMenu();
+    };
+    document.getElementById('dash-grid').addEventListener('click', (e) => {
+        const btn = e.target.closest('.gs-remove-btn');
+        if (!btn) return;
+        const id = btn.dataset.wid;
+        const item = btn.closest('.grid-stack-item');
+        dashGrid.removeWidget(item);
+        dashActiveWidgets = dashActiveWidgets.filter(w => w !== id);
+    });
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('#dash-add-wrap')) {
+            const m = document.getElementById('dash-add-menu');
+            if (m) m.style.display = 'none';
+        }
+    });
+
+    initPinnedBars();
+    tickDashboard();
+}
+
+function addDashWidget(item) {
+    const def = WIDGET_DEFS[item.id];
+    if (!def) return;
+    dashGrid.addWidget({
+        id: item.id,
+        x: item.x, y: item.y, w: item.w, h: item.h,
+        content: `<div class="gs-drag-handle"></div>
+            <button class="gs-remove-btn" data-wid="${item.id}" title="Remove widget">✕</button>
+            <div class="gs-widget-inner" id="wgt-${item.id}">${def.html()}</div>`,
+    });
+}
+
+function tickDashboard() {
+    for (const [id, def] of Object.entries(WIDGET_DEFS)) {
+        if (document.getElementById(`wgt-${id}`)) def.tick();
+    }
+}
+
+function setDashEditMode(on) {
+    dashEditing = on;
+    const container = document.getElementById('dashboard-view');
+    if (!container) return;
+    container.classList.toggle('dash-editing', on);
+    if (dashGrid) dashGrid.setStatic(!on);
+    const tog = document.getElementById('dash-edit-toggle');
+    const sav = document.getElementById('dash-save-btn');
+    const can = document.getElementById('dash-cancel-btn');
+    const add = document.getElementById('dash-add-wrap');
+    if (tog) tog.style.display = on ? 'none' : '';
+    if (sav) sav.style.display = on ? '' : 'none';
+    if (can) can.style.display = on ? '' : 'none';
+    if (add) add.style.display = on ? '' : 'none';
+}
+
+function saveDashLayout() {
+    if (!dashGrid) return;
+    const items = dashGrid.save(false, false);
+    const layout = items.map(n => ({ id: n.id, x: n.x, y: n.y, w: n.w, h: n.h })).filter(n => n.id);
+    localStorage.setItem('curb-dash-layout', JSON.stringify(layout));
+    setDashEditMode(false);
+}
+
+function cancelDashEdit() {
+    if (dashGrid) { dashGrid.destroy(false); dashGrid = null; }
+    setupDashboard();
+}
+
+function buildAddMenu() {
+    const menu = document.getElementById('dash-add-menu');
+    if (!menu) return;
+    menu.innerHTML = '';
+    const active = new Set(dashActiveWidgets);
+    let count = 0;
+    for (const [id, def] of Object.entries(WIDGET_DEFS)) {
+        if (active.has(id)) continue;
+        const btn = document.createElement('button');
+        btn.className = 'dash-add-item';
+        btn.textContent = def.title;
+        btn.onclick = (e) => {
+            e.stopPropagation();
+            const pos = def.defaultPos || { x: 0, y: 99, w: 4, h: 4 };
+            addDashWidget({ id, ...pos });
+            dashActiveWidgets.push(id);
+            menu.style.display = 'none';
+            tickDashboard();
+        };
+        menu.appendChild(btn);
+        count++;
+    }
+    if (count === 0) {
+        menu.innerHTML = '<div class="dash-add-item" style="color:var(--text-muted);cursor:default;">All widgets added</div>';
+    }
+}
+
+function renderDashboard() {
+    if (!dashGrid) {
+        setupDashboard();
+    } else {
+        tickDashboard();
+        tickPinnedBars();
+    }
+}
+
+function initPinnedBars() {
+    const zone = document.getElementById('dash-pinned-zone');
+    if (!zone) return;
+    zone.innerHTML = '';
+
+    const pinned = pinnedApps.map(exe => apps.find(a => a.exe === exe)).filter(Boolean);
+    if (pinned.length === 0) return;
+
+    const section = document.createElement('div');
+    section.className = 'pinned-section';
+
+    for (const app of pinned) {
+        const limit   = appLimits.find(l => l.exe === app.exe);
+        const downLit = limit && limit.down_bps != null;
+        const upLit   = limit && limit.up_bps   != null;
+        const color   = appColor(app.exe);
+        const exeId   = app.exe.replace(/\//g, '_');
+
+        const bar = document.createElement('div');
+        bar.className = 'pab';
+        bar.style.setProperty('--pab-color', color);
+        bar.innerHTML = `
+            <div class="pab-icon" style="background:${color}22;color:${color}">${escHtml(app.name[0].toUpperCase())}</div>
+            <div class="pab-meta">
+                <span class="pab-name">${escHtml(app.name)}</span>
+                <span class="pab-path">${escHtml(app.exe)}</span>
+            </div>
+            <div class="pab-stat download-text">
+                <span class="pab-arrow">↓</span>
+                <span class="pab-rate" id="prate-d-${exeId}">${formatRate(app.down_bps)}</span>
+                <svg class="pab-spark" id="psp-d-${exeId}"></svg>
+            </div>
+            <div class="pab-stat upload-text">
+                <span class="pab-arrow">↑</span>
+                <span class="pab-rate" id="prate-u-${exeId}">${formatRate(app.up_bps)}</span>
+                <svg class="pab-spark" id="psp-u-${exeId}"></svg>
+            </div>
+            <div class="pab-actions" id="pact-${exeId}"></div>
+            <button class="pab-unpin" title="Unpin">✕</button>
+        `;
+
+        bar.querySelector('.pab-unpin').onclick = () => togglePin(app.exe);
+
+        const actions = bar.querySelector(`#pact-${exeId}`);
+        const pDown = makeLimBtn('down', downLit);
+        const pUp   = makeLimBtn('up',   upLit);
+        pDown.onclick = (e) => {
+            e.stopPropagation();
+            showLimitPopup(pDown, `${app.exe}:down`, 'down', limit ? limit.down_bps : null,
+                (v) => setAppLimit(app.exe, 'down', v));
+        };
+        pUp.onclick = (e) => {
+            e.stopPropagation();
+            showLimitPopup(pUp, `${app.exe}:up`, 'up', limit ? limit.up_bps : null,
+                (v) => setAppLimit(app.exe, 'up', v));
+        };
+        actions.append(pDown, pUp);
+        section.appendChild(bar);
+    }
+
+    zone.appendChild(section);
+
+    // Draw sparklines after insertion so the elements are in the DOM
+    for (const app of pinned) {
+        const exeId = app.exe.replace(/\//g, '_');
+        createSparkline(document.getElementById(`psp-d-${exeId}`), app.down_spark, 'var(--download)', 60, 22);
+        createSparkline(document.getElementById(`psp-u-${exeId}`), app.up_spark,   'var(--upload)',   60, 22);
+    }
+}
+
+function tickPinnedBars() {
+    for (const exe of pinnedApps) {
+        const app = apps.find(a => a.exe === exe);
+        if (!app) continue;
+        const exeId = exe.replace(/\//g, '_');
+        const dEl = document.getElementById(`prate-d-${exeId}`);
+        if (!dEl) continue;
+        dEl.textContent = formatRate(app.down_bps);
+        document.getElementById(`prate-u-${exeId}`).textContent = formatRate(app.up_bps);
+        createSparkline(document.getElementById(`psp-d-${exeId}`), app.down_spark, 'var(--download)', 60, 22);
+        createSparkline(document.getElementById(`psp-u-${exeId}`), app.up_spark,   'var(--upload)',   60, 22);
+    }
 }
 
 function renderTopBar() {
@@ -498,11 +823,12 @@ function renderAppRow(tbody, app, level) {
             <div class="tree-indent" style="--level: ${level}">
                 <div class="tree-guide" style="--level: ${level}"></div>
                 <div class="app-cell">
-                    <div class="app-icon" style="border-top: 2px solid #34d399">${app.name[0].toUpperCase()}</div>
+                    <div class="app-icon" style="border-top: 2px solid ${appColor(app.exe)}">${app.name[0].toUpperCase()}</div>
                     <div class="app-info">
                         <span class="app-name">${app.name}</span>
                         <span class="app-path">${app.exe}</span>
                     </div>
+                    <button class="pin-btn ${pinnedApps.includes(app.exe) ? 'pin-btn-active' : ''}" title="${pinnedApps.includes(app.exe) ? 'Unpin from Dashboard' : 'Pin to Dashboard'}"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" stroke="none"><path d="M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z"/></svg></button>
                 </div>
             </div>
         </td>
@@ -548,6 +874,7 @@ function renderAppRow(tbody, app, level) {
     ruleCell.append(aDown, aUp);
 
     tr.querySelector('.quota-container').onclick = (e) => { e.stopPropagation(); promptQuota(app.exe); };
+    tr.querySelector('.pin-btn').onclick = (e) => { e.stopPropagation(); togglePin(app.exe); };
 
     tbody.appendChild(tr);
 
@@ -558,12 +885,17 @@ function renderAppRow(tbody, app, level) {
 function renderDetailStrip() {
     const app = apps.find(a => a.exe === selectedExe);
     const detailInfo = document.getElementById('detail-app-info');
+    const pillsContainer = detailInfo.querySelector('div:last-child');
+
     if (!app) {
-        detailInfo.querySelector('.detail-title').textContent = "—";
-        detailInfo.querySelector('.app-path').textContent = "—";
-        detailInfo.querySelector('div:last-child').innerHTML = "";
-        document.getElementById('detail-down-val').textContent = "0 B/s";
-        document.getElementById('detail-up-val').textContent = "0 B/s";
+        // No app selected — show host-wide totals and history.
+        detailInfo.querySelector('.detail-title').textContent = "This computer";
+        detailInfo.querySelector('.app-path').textContent = limiterState.interface || "—";
+        pillsContainer.innerHTML = `<div class="pill pill-muted">${apps.length} app${apps.length !== 1 ? 's' : ''}</div>`;
+        document.getElementById('detail-down-val').textContent = formatRate(hostTotals.down_bps);
+        document.getElementById('detail-up-val').textContent = formatRate(hostTotals.up_bps);
+        createAreaGraph(document.getElementById('svg-detail-down'), hostDownHistory, "var(--download)");
+        createAreaGraph(document.getElementById('svg-detail-up'),   hostUpHistory,   "var(--upload)");
         return;
     }
 
@@ -572,18 +904,12 @@ function renderDetailStrip() {
 
     detailInfo.querySelector('.detail-title').textContent = app.name;
     detailInfo.querySelector('.app-path').textContent = app.exe;
-    
+
     let status = "Watching";
     let statusClass = "pill-muted";
-    if (quota && quota.exceeded) {
-        status = "Throttled";
-        statusClass = "pill-rose";
-    } else if (limit) {
-        status = "Limited";
-        statusClass = "pill-emerald";
-    }
+    if (quota && quota.exceeded) { status = "Throttled"; statusClass = "pill-rose"; }
+    else if (limit)               { status = "Limited";   statusClass = "pill-emerald"; }
 
-    const pillsContainer = detailInfo.querySelector('div:last-child');
     pillsContainer.innerHTML = `<div class="pill ${statusClass}">${status}</div>`;
     if (limit) {
         pillsContainer.innerHTML += `<div class="pill pill-${limit.scope.toLowerCase()}">${limit.scope}</div>`;
@@ -591,9 +917,8 @@ function renderDetailStrip() {
 
     document.getElementById('detail-down-val').textContent = formatRate(app.down_bps);
     document.getElementById('detail-up-val').textContent = formatRate(app.up_bps);
-
     createAreaGraph(document.getElementById('svg-detail-down'), app.down_spark, "var(--download)");
-    createAreaGraph(document.getElementById('svg-detail-up'), app.up_spark, "var(--upload)");
+    createAreaGraph(document.getElementById('svg-detail-up'),   app.up_spark,   "var(--upload)");
 }
 
 // --- Rules Tab ---
@@ -1229,11 +1554,13 @@ if (masterToggle) masterToggle.onclick = toggleMasterLimiter;
 const searchBox = document.getElementById('search-apps');
 if (searchBox) searchBox.oninput = (e) => { searchQuery = e.target.value; renderTable(); };
 
-// Wire the sidebar tabs: switch the active item and the current view.
-document.querySelectorAll('.nav-item').forEach((item) => {
+const VIEW_LABEL = { dashboard: 'Dashboard', apps: 'Applications', rules: 'Rules', quotas: 'Quotas', connections: 'Connections', settings: 'Settings' };
+
+// Wire the sidebar tabs using data-view attributes.
+document.querySelectorAll('.nav-item[data-view]').forEach((item) => {
     item.onclick = (e) => {
         e.preventDefault();
-        currentView = item.textContent.trim();
+        currentView = VIEW_LABEL[item.dataset.view] || item.dataset.view;
         document.querySelectorAll('.nav-item').forEach((n) => n.classList.remove('active'));
         item.classList.add('active');
         renderTable();
@@ -1258,6 +1585,228 @@ document.addEventListener('input', (e) => {
     }
 });
 
+// ── Theme system ─────────────────────────────────────────────────────────────
+
+const THEMES = {
+    'CURB Dark': {
+        '--app-bg': '#0b0e14', '--surface': '#131722', '--elevated': '#1a2030',
+        '--border': '#232a39', '--text-primary': '#e6e9ef', '--text-muted': '#8a93a6',
+        '--download': '#38bdf8', '--upload': '#fb923c', '--brand': '#34d399',
+        '--danger': '#fb7185', '--lan': 'rgba(45,212,191,0.15)', '--lan-text': '#2dd4bf',
+        '--internet': 'rgba(129,140,248,0.15)', '--internet-text': '#818cf8',
+    },
+    'Midnight': {
+        '--app-bg': '#080c18', '--surface': '#0d1225', '--elevated': '#121930',
+        '--border': '#1a2340', '--text-primary': '#c8d4f0', '--text-muted': '#6272a4',
+        '--download': '#58a6ff', '--upload': '#ffa657', '--brand': '#56d364',
+        '--danger': '#ff7b72', '--lan': 'rgba(86,211,100,0.15)', '--lan-text': '#56d364',
+        '--internet': 'rgba(88,166,255,0.15)', '--internet-text': '#58a6ff',
+    },
+    'Dracula': {
+        '--app-bg': '#1e1e2e', '--surface': '#21222c', '--elevated': '#2d2d3f',
+        '--border': '#3a3a52', '--text-primary': '#f8f8f2', '--text-muted': '#8b949e',
+        '--download': '#8be9fd', '--upload': '#ffb86c', '--brand': '#50fa7b',
+        '--danger': '#ff5555', '--lan': 'rgba(80,250,123,0.15)', '--lan-text': '#50fa7b',
+        '--internet': 'rgba(189,147,249,0.15)', '--internet-text': '#bd93f9',
+    },
+    'Nord': {
+        '--app-bg': '#2e3440', '--surface': '#3b4252', '--elevated': '#434c5e',
+        '--border': '#4c566a', '--text-primary': '#eceff4', '--text-muted': '#9099aa',
+        '--download': '#88c0d0', '--upload': '#d08770', '--brand': '#a3be8c',
+        '--danger': '#bf616a', '--lan': 'rgba(163,190,140,0.15)', '--lan-text': '#a3be8c',
+        '--internet': 'rgba(136,192,208,0.15)', '--internet-text': '#88c0d0',
+    },
+    'Solarized Dark': {
+        '--app-bg': '#002b36', '--surface': '#073642', '--elevated': '#0d4151',
+        '--border': '#135361', '--text-primary': '#eee8d5', '--text-muted': '#839496',
+        '--download': '#268bd2', '--upload': '#cb4b16', '--brand': '#2aa198',
+        '--danger': '#dc322f', '--lan': 'rgba(42,161,152,0.15)', '--lan-text': '#2aa198',
+        '--internet': 'rgba(38,139,210,0.15)', '--internet-text': '#268bd2',
+    },
+    'Gruvbox': {
+        '--app-bg': '#1d2021', '--surface': '#282828', '--elevated': '#3c3836',
+        '--border': '#504945', '--text-primary': '#ebdbb2', '--text-muted': '#928374',
+        '--download': '#83a598', '--upload': '#fe8019', '--brand': '#b8bb26',
+        '--danger': '#fb4934', '--lan': 'rgba(184,187,38,0.15)', '--lan-text': '#b8bb26',
+        '--internet': 'rgba(131,165,152,0.15)', '--internet-text': '#83a598',
+    },
+    'Tokyo Night': {
+        '--app-bg': '#1a1b2e', '--surface': '#1f2040', '--elevated': '#252650',
+        '--border': '#2e3153', '--text-primary': '#c0caf5', '--text-muted': '#565f89',
+        '--download': '#7dcfff', '--upload': '#ff9e64', '--brand': '#9ece6a',
+        '--danger': '#f7768e', '--lan': 'rgba(158,206,106,0.15)', '--lan-text': '#9ece6a',
+        '--internet': 'rgba(125,207,255,0.15)', '--internet-text': '#7dcfff',
+    },
+    'Catppuccin': {
+        '--app-bg': '#1e1e2e', '--surface': '#181825', '--elevated': '#1e1e2e',
+        '--border': '#313244', '--text-primary': '#cdd6f4', '--text-muted': '#6c7086',
+        '--download': '#89dceb', '--upload': '#fab387', '--brand': '#a6e3a1',
+        '--danger': '#f38ba8', '--lan': 'rgba(166,227,161,0.15)', '--lan-text': '#a6e3a1',
+        '--internet': 'rgba(137,220,235,0.15)', '--internet-text': '#89dceb',
+    },
+    'One Dark': {
+        '--app-bg': '#21252b', '--surface': '#282c34', '--elevated': '#2c313c',
+        '--border': '#3e4451', '--text-primary': '#abb2bf', '--text-muted': '#5c6370',
+        '--download': '#61afef', '--upload': '#d19a66', '--brand': '#98c379',
+        '--danger': '#e06c75', '--lan': 'rgba(152,195,121,0.15)', '--lan-text': '#98c379',
+        '--internet': 'rgba(97,175,239,0.15)', '--internet-text': '#61afef',
+    },
+    'Matrix': {
+        '--app-bg': '#000000', '--surface': '#0a0f0a', '--elevated': '#0f180f',
+        '--border': '#1a2e1a', '--text-primary': '#00ff41', '--text-muted': '#00832b',
+        '--download': '#00e676', '--upload': '#69ff47', '--brand': '#00ff41',
+        '--danger': '#ff1744', '--lan': 'rgba(0,255,65,0.1)', '--lan-text': '#00ff41',
+        '--internet': 'rgba(0,230,118,0.1)', '--internet-text': '#00e676',
+    },
+    'Sunset': {
+        '--app-bg': '#1a0e1e', '--surface': '#261228', '--elevated': '#331834',
+        '--border': '#45233a', '--text-primary': '#f2c5d4', '--text-muted': '#9a6b7e',
+        '--download': '#f48fb1', '--upload': '#ffb74d', '--brand': '#ce93d8',
+        '--danger': '#ff5252', '--lan': 'rgba(206,147,216,0.15)', '--lan-text': '#ce93d8',
+        '--internet': 'rgba(244,143,177,0.15)', '--internet-text': '#f48fb1',
+    },
+    'Ocean': {
+        '--app-bg': '#0a1628', '--surface': '#0d1f3c', '--elevated': '#112749',
+        '--border': '#1a3460', '--text-primary': '#d0e8f5', '--text-muted': '#6a8caa',
+        '--download': '#4dd0e1', '--upload': '#4fc3f7', '--brand': '#26c6da',
+        '--danger': '#ef5350', '--lan': 'rgba(38,198,218,0.15)', '--lan-text': '#26c6da',
+        '--internet': 'rgba(77,208,225,0.15)', '--internet-text': '#4dd0e1',
+    },
+    'Light': {
+        '--app-bg': '#f5f7fa', '--surface': '#ffffff', '--elevated': '#f0f2f5',
+        '--border': '#d9dde5', '--text-primary': '#1a202c', '--text-muted': '#718096',
+        '--download': '#0284c7', '--upload': '#ea580c', '--brand': '#059669',
+        '--danger': '#dc2626', '--lan': 'rgba(5,150,105,0.12)', '--lan-text': '#059669',
+        '--internet': 'rgba(2,132,199,0.12)', '--internet-text': '#0284c7',
+    },
+};
+
+const THEME_NAMES = Object.keys(THEMES);
+let activeTheme = localStorage.getItem('curb-theme') || 'CURB Dark';
+
+function applyTheme(name) {
+    const t = THEMES[name] || parseCustomTheme();
+    if (!t) return;
+    const root = document.documentElement;
+    for (const [k, v] of Object.entries(t)) root.style.setProperty(k, v);
+    activeTheme = name;
+    localStorage.setItem('curb-theme', name);
+    // Re-render settings to update the selection highlight.
+    if (currentView === 'Settings') renderSettings();
+}
+
+function parseCustomTheme() {
+    try {
+        const raw = localStorage.getItem('curb-custom-theme');
+        return raw ? JSON.parse(raw) : null;
+    } catch { return null; }
+}
+
+function renderSettings() {
+    const view = document.getElementById('settings-view');
+
+    const themeCards = THEME_NAMES.map(name => {
+        const t = THEMES[name];
+        const active = name === activeTheme;
+        return `<div class="theme-card ${active ? 'theme-card-active' : ''}" data-theme="${escHtml(name)}">
+            <div class="theme-preview" style="background:${t['--app-bg']}; border-color:${t['--border']};">
+                <div class="theme-prev-sidebar" style="background:${t['--surface']}; border-color:${t['--border']};"></div>
+                <div class="theme-prev-body" style="background:${t['--app-bg']};">
+                    <div class="theme-prev-bar" style="background:${t['--elevated']}; border-color:${t['--border']};"></div>
+                    <div class="theme-prev-row" style="background:${t['--surface']}; border-color:${t['--border']};"></div>
+                    <div class="theme-prev-accent" style="background:${t['--brand']};"></div>
+                    <div class="theme-prev-dl" style="background:${t['--download']};"></div>
+                    <div class="theme-prev-ul" style="background:${t['--upload']};"></div>
+                </div>
+            </div>
+            <div class="theme-name">${escHtml(name)}</div>
+            ${active ? '<div class="theme-active-badge">Active</div>' : ''}
+        </div>`;
+    }).join('');
+
+    const customRaw = localStorage.getItem('curb-custom-theme') || '';
+    view.innerHTML = `
+        <div class="settings-scroll">
+            <section class="settings-section">
+                <div class="settings-section-title">Theme</div>
+                <div class="theme-grid" id="theme-grid">${themeCards}</div>
+            </section>
+
+            <section class="settings-section">
+                <div class="settings-section-title">Custom Theme</div>
+                <p class="settings-hint">
+                    Paste a JSON object with CSS variable overrides below and click Apply.
+                    See <code>CREATING_THEMES.md</code> in the project directory for the full variable list
+                    and instructions on asking an AI to generate a theme.
+                </p>
+                <textarea id="custom-theme-input" class="custom-theme-ta" spellcheck="false" placeholder='{
+  "--app-bg": "#0b0e14",
+  "--surface": "#131722",
+  "--download": "#38bdf8",
+  "--upload": "#fb923c"
+}'>${escHtml(customRaw)}</textarea>
+                <div class="settings-row">
+                    <button id="apply-custom-theme-btn" class="modal-btn modal-btn-ok">Apply Custom Theme</button>
+                    <button id="clear-custom-theme-btn" class="modal-btn modal-btn-cancel">Clear</button>
+                    <span id="custom-theme-error" class="custom-theme-err"></span>
+                </div>
+            </section>
+        </div>
+    `;
+
+    document.getElementById('theme-grid').addEventListener('click', (e) => {
+        const card = e.target.closest('[data-theme]');
+        if (card) applyTheme(card.dataset.theme);
+    });
+    document.getElementById('apply-custom-theme-btn').onclick = applyCustomTheme;
+    document.getElementById('clear-custom-theme-btn').onclick = clearCustomTheme;
+}
+
+function applyCustomTheme() {
+    const raw = document.getElementById('custom-theme-input').value.trim();
+    const errEl = document.getElementById('custom-theme-error');
+    try {
+        const parsed = JSON.parse(raw);
+        if (typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Must be a JSON object');
+        const root = document.documentElement;
+        for (const [k, v] of Object.entries(parsed)) {
+            if (k.startsWith('--')) root.style.setProperty(k, v);
+        }
+        localStorage.setItem('curb-custom-theme', raw);
+        activeTheme = 'Custom';
+        localStorage.setItem('curb-theme', 'Custom');
+        errEl.textContent = 'Custom theme applied.';
+        errEl.style.color = 'var(--brand)';
+        // De-highlight preset cards.
+        document.querySelectorAll('.theme-card').forEach(c => c.classList.remove('theme-card-active'));
+    } catch (e) {
+        errEl.textContent = 'Invalid JSON: ' + e.message;
+        errEl.style.color = 'var(--danger)';
+    }
+}
+
+function clearCustomTheme() {
+    localStorage.removeItem('curb-custom-theme');
+    document.getElementById('custom-theme-input').value = '';
+    // Revert to last named theme or default.
+    const fallback = THEME_NAMES.includes(activeTheme) ? activeTheme : 'CURB Dark';
+    applyTheme(fallback);
+}
+
+// Apply saved theme on startup.
+if (activeTheme === 'Custom') {
+    const custom = parseCustomTheme();
+    if (custom) {
+        const root = document.documentElement;
+        for (const [k, v] of Object.entries(custom)) root.style.setProperty(k, v);
+    } else {
+        applyTheme('CURB Dark');
+    }
+} else {
+    applyTheme(activeTheme);
+}
+
+// ── Start polling ─────────────────────────────────────────────────────────────
 // Start polling
 poll();
 setInterval(poll, 1000);

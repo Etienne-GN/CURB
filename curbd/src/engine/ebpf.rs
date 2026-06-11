@@ -45,8 +45,10 @@ struct FlowKey {
 unsafe impl aya::Pod for FlowKey {}
 
 /// Owns the loaded program (keeping it attached) and its classid map.
+/// The `_ingress_link` must be kept alive — dropping it detaches the filter.
 pub struct EbpfShaper {
     bpf: Mutex<Ebpf>,
+    _ingress_link: Box<dyn std::any::Any + Send + Sync>,
 }
 
 impl EbpfShaper {
@@ -80,20 +82,16 @@ impl EbpfShaper {
 
         // Always attach the mark-setter: reads flow map, sets skb->mark,
         // returns TC_ACT_UNSPEC — safe on any live interface.
+        // Use .attach() (same as egress) and keep the returned link alive in
+        // the struct — attach_with_options() drops the filter when its link is
+        // discarded (Aya 0.13 behaviour).
         let setmark: &mut SchedClassifier = bpf
             .program_mut("curb_ingress_setmark")
             .ok_or_else(|| anyhow!("curb_ingress_setmark program missing"))?
             .try_into()?;
         setmark.load().context("loading curb_ingress_setmark")?;
-        setmark
-            .attach_with_options(
-                iface,
-                TcAttachType::Ingress,
-                TcAttachOptions::Netlink(NlOptions {
-                    priority: INGRESS_BPF_PRIORITY + 1, // prio 2, after setprio if active
-                    handle: 0,
-                }),
-            )
+        let ingress_link = setmark
+            .attach(iface, TcAttachType::Ingress)
             .context("attaching curb_ingress_setmark")?;
 
         if ingress {
@@ -119,6 +117,7 @@ impl EbpfShaper {
 
         Ok(Self {
             bpf: Mutex::new(bpf),
+            _ingress_link: Box::new(Mutex::new(ingress_link)),
         })
     }
 

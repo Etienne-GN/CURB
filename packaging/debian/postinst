@@ -1,0 +1,32 @@
+#!/bin/sh
+# Debian postinst script for the curb package.
+set -e
+
+case "$1" in
+configure)
+    # Create the curb system group (idempotent).
+    if ! getent group curb > /dev/null 2>&1; then
+        groupadd --system curb
+    fi
+
+    # Enable and start the daemon.
+    if command -v systemctl > /dev/null 2>&1 && systemctl is-system-running --quiet 2>/dev/null; then
+        systemctl daemon-reload
+        systemctl enable curbd.service
+        systemctl restart curbd.service || true
+    fi
+
+    echo ""
+    echo "CURB installed. To allow a non-root user to control the daemon:"
+    echo "  sudo usermod -aG curb \$USER"
+    echo "Then log out and back in."
+    ;;
+abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+*)
+    echo "postinst called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

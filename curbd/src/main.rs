@@ -82,10 +82,14 @@ async fn main() -> Result<()> {
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("binding control socket {}", path.display()))?;
 
-    // 0o660 so members of the (future) `curb` group can drive the daemon
-    // without being root. Group ownership is configured by packaging, not here.
+    // 0o660 so members of the `curb` group can drive the daemon without root.
+    // When running under systemd with Group=curb the process GID is already
+    // `curb`, so the socket inherits it automatically.  When started manually
+    // (dev / direct invocation) we chown explicitly so the dev workflow also
+    // works after `groupadd curb && usermod -aG curb $USER`.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
         .with_context(|| format!("setting permissions on {}", path.display()))?;
+    set_socket_group(&path);
 
     // Start the live traffic monitor. If capture can't open (missing
     // CAP_NET_RAW), keep serving — status/ping still work and ListApps reports
@@ -309,5 +313,39 @@ fn engine_unavailable() -> Response {
     Response::Error {
         message: "shaping engine unavailable (curbd needs CAP_NET_ADMIN and a default route)"
             .to_string(),
+    }
+}
+
+/// Set the control socket's group to `curb` (gid looked up at runtime).
+///
+/// When systemd runs the daemon with `Group=curb` this is a no-op (the socket
+/// already inherits the process GID). When started manually as root it makes
+/// the socket accessible to members of the `curb` group without a systemd
+/// restart, which is the normal dev workflow.
+fn set_socket_group(path: &std::path::Path) {
+    use std::ffi::CString;
+    let cname = CString::new("curb").unwrap();
+    // SAFETY: getgrnam is thread-safe when called before threads are spawned;
+    // we call it synchronously during startup, before the Tokio runtime accepts
+    // any connections.
+    let gid = unsafe {
+        let grp = libc::getgrnam(cname.as_ptr());
+        if grp.is_null() {
+            warn!(
+                "group `curb` not found — socket is root-only. \
+                 Run the install script or: sudo groupadd curb && sudo usermod -aG curb $USER"
+            );
+            return;
+        }
+        (*grp).gr_gid
+    };
+    let c_path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: chown on a path we just created; errors are non-fatal.
+    let rc = unsafe { libc::chown(c_path.as_ptr(), libc::uid_t::MAX, gid) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        warn!(error = %err, "could not chown socket to curb group");
+    } else {
+        info!("socket group set to `curb` (gid {gid})");
     }
 }

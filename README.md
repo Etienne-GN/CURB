@@ -1,96 +1,145 @@
-# CURB
+# CURB — Connection Usage & Rate Balancer
 
-**C**onnection **U**sage & **R**ate **B**alancer — NetLimiter-style, per-application
-bandwidth monitoring and control for Linux.
-
-CURB lets you watch and limit network bandwidth **per application**, live, with
-separate inbound/outbound controls, host-wide caps, LAN-vs-internet scoping, and
-data quotas. It ships as a CLI (`curb`) and a dark-themed desktop GUI.
-
-> Status: early development. See [the build plan](#roadmap) for what works today.
-
-## Architecture
-
-| Component | Crate / dir | Role |
-|-----------|-------------|------|
-| Contract  | `proto/` (`curb-proto`) | The frozen IPC wire protocol + client library shared by every component. |
-| Engine    | `curbd/` | Privileged daemon. Owns the control socket and (from P2) the eBPF/tc/cgroup traffic engine. |
-| CLI       | `cli/` (`curb`) | Command-line client. |
-| GUI       | `gui/` *(later)* | Tauri app: Rust backend = thin client of `curbd`; web frontend = the UI. |
-
-The daemon runs privileged (systemd service) and listens on a Unix socket
-(`/run/curbd.sock`, mode `0660`, group `curb`). The CLI and GUI are unprivileged
-clients of that socket.
-
-## Build
-
-```sh
-cargo build            # builds curb-proto, curbd, curb
-```
-
-Requirements for the engine (later phases): Linux kernel ≥ 5.10 with BTF
-(`/sys/kernel/btf/vmlinux`), cgroup v2, and `CAP_NET_ADMIN`/`CAP_BPF`.
-
-## Try it (P0)
-
-Run the daemon and talk to it over a dev socket (no root needed):
-
-```sh
-CURB_SOCK=/tmp/curbd.sock cargo run -p curbd            # terminal 1
-CURB_SOCK=/tmp/curbd.sock cargo run -p curb -- ping     # terminal 2
-CURB_SOCK=/tmp/curbd.sock cargo run -p curb -- status
-```
-
-## GUI
-
-A dark-themed Tauri desktop app lives in `gui/`. Its Rust backend
-(`gui/src-tauri`) is a thin client of `curbd` over the same control socket; the
-frontend polls live traffic and drives the limit/quota controls.
-
-```sh
-cd gui/src-tauri && cargo build      # needs Tauri's Linux deps (see below)
-# run against a daemon (set CURB_SOCK to match the running curbd):
-CURB_SOCK=/run/curbd.sock ./target/debug/gui
-```
-
-Build deps (Debian/Ubuntu): `pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev
-librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev`.
+Per-application network bandwidth monitoring and control for Linux. Think
+[NetLimiter](https://www.netlimiter.com/) — but native, open-source, and built
+on eBPF.
 
 ![CURB GUI](design/gui-live.png)
 
-## Roadmap
+---
 
-- **P0 — Scaffold** ✅ workspace, IPC contract, daemon + CLI skeletons, `ping`/`status`.
-- **P1 — Live monitoring** ✅ AF_PACKET capture + `/proc` per-app attribution, `curb top`.
-- **P2 — Host-wide limits** ✅ tc HTB + IFB; live on/off and rate changes; in/out split.
-- **P3 — Per-app limits** ✅ cgroup v2 + nftables `socket cgroupv2` policing.
-- **P4 — LAN vs Internet** ✅ per-rule scope matching.
-- **P5 — Quotas** ✅ per-app accounting + block-on-exceed + persistence.
-- **P6 — GUI** ✅ live dark-themed Tauri app wired to the daemon.
+## Features
 
-### eBPF shaping
+- **Live per-app monitoring** — real-time download/upload rates with 60-second
+  sparkline history for every running application
+- **Per-app rate limits** — independent download and upload caps, shaped smoothly
+  via HTB queuing (no packet drops on egress)
+- **Data quotas** — daily/weekly/monthly byte budgets; automatically blocks an app
+  when its budget is exceeded
+- **LAN vs Internet scoping** — apply limits to local-network traffic, internet
+  traffic, or both, independently
+- **Master toggle** — enable/disable all shaping instantly without losing rules
+- **Host-wide limits** — cap total machine-wide bandwidth independent of per-app rules
+- **Connections view** — live table of every active TCP/UDP socket with PID and app
+- **Desktop GUI** — draggable/resizable widget dashboard, pinned-app quick
+  controls, 13 built-in themes + custom JSON themes
+- **CLI** — `curb apps`, `curb app firefox limit --down 5mbit`, `curb top`, etc.
 
-Per-app **upload** is shaped smoothly via an eBPF egress classifier + HTB
-(queuing, not dropping). Per-app **download** defaults to nftables policing.
+---
 
-Smooth eBPF **download** shaping (clsact ingress set-priority + `mirred` redirect
-to an IFB device + HTB) is implemented but **off by default** — enable it with:
+## Requirements
+
+| Requirement | Notes |
+|---|---|
+| Linux kernel ≥ 5.10 | BTF required — `/sys/kernel/btf/vmlinux` must exist |
+| cgroup v2 | Default on all modern distros |
+| `clang` | eBPF compilation at build time |
+| `nftables` | Runtime — `nft` in `$PATH` |
+| `iproute2` | Runtime — `tc` and `ip` in `$PATH` |
+| Root (daemon only) | `curbd` runs via systemd; GUI and CLI are unprivileged |
+
+---
+
+## Install
 
 ```sh
-CURB_EBPF_INGRESS=1 curbd
+# 1. Build release binaries
+cargo build --release -p curbd -p curb
+cd gui && cargo tauri build && cd ..
+
+# 2. Install system-wide
+sudo ./packaging/install.sh
 ```
 
-> ⚠️ The download path redirects all ingress through an IFB device. It is
-> validated end-to-end in an isolated network namespace
-> (`scripts/netns_daemon_test.sh`) — run that to verify on your kernel before
-> enabling on a real interface. An earlier `bpf_redirect`-based attempt
-> blackholed inbound traffic; the shipped path uses the reinjection-correct
-> `mirred` redirect instead.
+The install script creates a `curb` system group, installs all binaries, sets
+the setgid bit so the GUI and CLI work immediately from any terminal or desktop
+shortcut (no logout/login required), and enables the `curbd` systemd service.
 
-### Future
-- proc-connector exec hook to place processes in their cgroup before they
-  connect (catch already-established connections).
-- Host-wide LAN/Internet scoping; per-app live graphs history; system tray.
+**Build deps (Debian/Ubuntu):**
+```sh
+sudo apt install clang pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
+     librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev nftables iproute2
+```
+
+---
+
+## Development
+
+```sh
+# Terminal 1 — daemon (root required for eBPF/tc/cgroups)
+make daemon
+
+# Terminal 2 — GUI with hot-reload
+make gui
+
+# CLI against the running daemon
+sg curb -c "./target/debug/curb apps"
+sg curb -c "./target/debug/curb app /opt/google/chrome/chrome limit --down 10mbit"
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────┐  Unix socket  ┌─────────────────────────────────────────┐
+│  curb (CLI) │──────────────▶│  curbd  (privileged daemon)             │
+│  curb-gui   │──────────────▶│                                         │
+└─────────────┘               │  eBPF tc classifier (Aya)               │
+                              │    cgroup→classid + flow→classid maps   │
+                              │    ingress set-mark program              │
+                              │                                         │
+                              │  tc HTB        (egress shaping)         │
+                              │  nftables      (ingress policing)       │
+                              │  cgroup v2     (per-app process groups) │
+                              │  proc-connector (exec hook, <1ms)       │
+                              └─────────────────────────────────────────┘
+```
+
+1. `curbd` creates a cgroup v2 per managed app and places all its PIDs there.
+   New processes are detected in under a millisecond via the kernel's
+   proc-connector Netlink interface.
+2. An Aya eBPF `tc` classifier maps each packet's socket cgroup to its HTB
+   classid, writing it to `skb->priority` (egress) or `skb->mark` (ingress).
+3. **Egress** — HTB on the real NIC shapes upload smoothly (queuing, not dropping).
+4. **Ingress** — nftables polices by `meta mark`, dropping excess per-app packets.
+5. The daemon samples eBPF accounting maps every second for live rates and totals.
+
+---
+
+## CLI reference
+
+```sh
+curb apps                                          # live per-app rate table
+curb top                                           # live view (updates in-place)
+curb app <exe> limit --down 5mbit --up 2mbit       # set rate limits
+curb app <exe> limit --down 5mbit --scope internet # internet traffic only
+curb app <exe> unlimit                             # remove limits
+curb quota set <exe> --budget 1GB --period daily   # set data quota
+curb quota list                                    # show quota status
+curb quota clear <exe>                             # remove quota
+curb host limit --down 100mbit --up 20mbit         # host-wide cap
+curb host off                                      # remove host cap
+curb limiter on|off                                # master toggle
+curb ping                                          # check daemon health
+```
+
+---
+
+## eBPF ingress shaping (advanced / experimental)
+
+Smooth per-app download shaping via IFB + HTB is implemented but off by default.
+Enable with `CURB_EBPF_INGRESS=1 curbd`. Test in an isolated network namespace
+first — see the warning in [the engine source](curbd/src/engine/ebpf.rs).
+
+---
+
+## Themes
+
+The GUI ships 13 built-in themes. To create a custom theme see
+[CREATING_THEMES.md](CREATING_THEMES.md).
+
+---
 
 ## License
 

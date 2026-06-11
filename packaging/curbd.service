@@ -9,14 +9,30 @@ ExecStart=/usr/local/bin/curbd
 Restart=on-failure
 RestartSec=2
 
-# The traffic engine (later phases) needs these to manage tc/qdiscs, eBPF
-# programs, and cgroups. Granted ambiently so curbd does not run fully as root.
-AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN
-
-# Members of the `curb` group may drive the daemon via /run/curbd.sock (0660).
-# Create the group during install: `groupadd -f curb`.
+# Run as root (required for eBPF, tc, and cgroup manipulation), but set the
+# supplementary group to `curb` so the control socket (/run/curbd.sock) is
+# created with group ownership `curb` and mode 0660.  Members of the `curb`
+# group can then control the daemon without root.
 Group=curb
+
+# Minimal capabilities — no full root privileges at the OS level.
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN CAP_NET_RAW
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=no
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
+RestrictNamespaces=no
+SystemCallArchitectures=native
+LockPersonality=yes
+
+# /run/curbd.sock lives here; systemd creates and owns the directory.
+RuntimeDirectory=curbd
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target

@@ -83,7 +83,14 @@ impl UsageTracker {
     /// Load persisted data and start the background accounting thread.
     pub fn start(monitor: Monitor) -> Self {
         let path = state_path();
-        let data = load(&path);
+        let mut data = load(&path);
+        // On restart the monitor's per-app totals reset to zero, so the
+        // persisted last_down/last_up cursors are stale.  Reset them so the
+        // first tick accumulates all traffic from this new daemon session.
+        for entry in data.entries.values_mut() {
+            entry.last_down = 0;
+            entry.last_up = 0;
+        }
         let inner = Arc::new(Inner {
             monitor,
             path,
@@ -155,8 +162,10 @@ impl Inner {
                 week_start: week_start.clone(),
                 month: Bucket::default(),
                 month_start: month_start.clone(),
-                last_down: app.down_total,
-                last_up: app.up_total,
+                // Start from 0 so the first tick counts all traffic since
+                // daemon start, not just traffic after the first poll.
+                last_down: 0,
+                last_up: 0,
             });
 
             // Roll over any buckets whose calendar period has ended.

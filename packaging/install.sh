@@ -62,11 +62,8 @@ GUI_BIN="$REPO_ROOT/gui/src-tauri/target/release/curb"
 [ -f "$GUI_BIN" ] || GUI_BIN="$REPO_ROOT/gui/src-tauri/target/release/gui"
 if [ -f "$GUI_BIN" ]; then
     install -Dm755 "$GUI_BIN" /usr/local/bin/curb-gui
-    # setgid bit: the process runs as group `curb` regardless of the user's
-    # current session groups — no logout/login required after install.
-    chown root:curb /usr/local/bin/curb-gui
-    chmod g+s       /usr/local/bin/curb-gui
-    info "Installed /usr/local/bin/curb-gui (setgid:curb)."
+    # GTK refuses setgid — the GUI relies on the user being in the curb group.
+    info "Installed /usr/local/bin/curb-gui."
 fi
 
 # ── 6. Install .desktop file (GUI launcher) ──────────────────────────────────

@@ -10,8 +10,8 @@ Restart=on-failure
 RestartSec=2
 
 # Run as root (required for eBPF, tc, and cgroup manipulation), but set the
-# supplementary group to `curb` so the control socket (/run/curbd.sock) is
-# created with group ownership `curb` and mode 0660.  Members of the `curb`
+# supplementary group to `curb` so the control socket (/run/curbd/curbd.sock)
+# is created with group ownership `curb` and mode 0660.  Members of the `curb`
 # group can then control the daemon without root.
 Group=curb
 
@@ -30,7 +30,7 @@ RestrictNamespaces=no
 SystemCallArchitectures=native
 LockPersonality=yes
 
-# /run/curbd.sock lives here; systemd creates and owns the directory.
+# /run/curbd/curbd.sock lives here; systemd creates and owns the directory.
 RuntimeDirectory=curbd
 RuntimeDirectoryMode=0755
 

@@ -71,6 +71,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let path = args.socket.unwrap_or_else(socket_path);
 
+    // Ensure the parent directory exists (systemd creates /run/curbd/ via
+    // RuntimeDirectory=curbd; when running manually it may not exist yet).
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket directory {}", parent.display()))?;
+    }
+
     // Single-instance assumption: clear a stale socket file from a previous
     // run so bind() succeeds. (A future version should refuse if a live daemon
     // still answers on it.)

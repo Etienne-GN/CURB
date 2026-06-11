@@ -4,7 +4,7 @@
 # The daemon must already be running (make daemon).
 # sg curb ensures the process has the curb group even before a logout/login.
 gui:
-	cd gui && sg curb -c "CURB_SOCK=/run/curbd.sock ./node_modules/.bin/tauri dev"
+	cd gui && sg curb -c "CURB_SOCK=/run/curbd/curbd.sock ./node_modules/.bin/tauri dev"
 
 # Build and (re)start the daemon in the foreground.
 # Run in a separate terminal; Ctrl-C to stop.

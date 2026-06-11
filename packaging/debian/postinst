@@ -9,13 +9,21 @@ configure)
         groupadd --system curb
     fi
 
-    # setgid bit: binaries run as group curb so the socket is accessible
-    # immediately from any terminal or desktop shortcut — no logout required.
+    # setgid bit on the CLI so it can reach the socket without the user
+    # having to log out and back in. The GUI cannot use setgid because GTK
+    # refuses to initialize when effective GID != real GID.
     chown root:curb /usr/local/bin/curb
     chmod g+s       /usr/local/bin/curb
-    if [ -f /usr/local/bin/curb-gui ]; then
-        chown root:curb /usr/local/bin/curb-gui
-        chmod g+s       /usr/local/bin/curb-gui
+
+    # For the GUI, add the installing user to the curb group instead.
+    INSTALL_USER="${SUDO_USER:-}"
+    if [ -n "$INSTALL_USER" ] && [ "$INSTALL_USER" != "root" ]; then
+        usermod -aG curb "$INSTALL_USER" 2>/dev/null || true
+        echo "  Added '$INSTALL_USER' to the 'curb' group."
+        echo "  Log out and back in (or run: newgrp curb) for curb-gui to work."
+    else
+        echo "  Add yourself to the 'curb' group for curb-gui:"
+        echo "    sudo usermod -aG curb \$USER  (then log out/in)"
     fi
 
     # Enable and start the daemon.

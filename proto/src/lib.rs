@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Default socket location used by the packaged daemon.
-pub const DEFAULT_SOCKET_PATH: &str = "/run/curbd.sock";
+pub const DEFAULT_SOCKET_PATH: &str = "/run/curbd/curbd.sock";
 
 /// Resolve the control socket path.
 ///

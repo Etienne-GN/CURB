@@ -10,8 +10,20 @@ STAGE="/tmp/$PKG"
 
 echo "Building CURB $VERSION .deb…"
 
-# Build release binaries
-cargo build --release -p curbd -p curb
+# Build release binaries (skip if already built — CI builds first, then calls this)
+if [ ! -f "$REPO_ROOT/target/release/curbd" ] || [ ! -f "$REPO_ROOT/target/release/curb" ]; then
+    cargo build --release -p curbd -p curb
+fi
+
+# Build GUI (skip if already built)
+GUI_BIN="$REPO_ROOT/gui/src-tauri/target/release/curb"
+if [ ! -f "$GUI_BIN" ]; then
+    echo "Building GUI…"
+    cd "$REPO_ROOT/gui"
+    npm install --prefer-offline
+    cargo build --release --manifest-path src-tauri/Cargo.toml
+    cd "$REPO_ROOT"
+fi
 
 # Stage tree
 rm -rf "$STAGE"
@@ -23,10 +35,9 @@ mkdir -p "$STAGE/etc/systemd/system"
 install -m755 "$REPO_ROOT/target/release/curbd" "$STAGE/usr/local/bin/curbd"
 install -m755 "$REPO_ROOT/target/release/curb"  "$STAGE/usr/local/bin/curb"
 
-# GUI binary (if built)
-GUI="$REPO_ROOT/gui/src-tauri/target/release/gui"
-if [ -f "$GUI" ]; then
-    install -m755 "$GUI" "$STAGE/usr/local/bin/curb-gui"
+# GUI binary
+if [ -f "$GUI_BIN" ]; then
+    install -m755 "$GUI_BIN" "$STAGE/usr/local/bin/curb-gui"
     mkdir -p "$STAGE/usr/share/applications"
     install -m644 "$REPO_ROOT/packaging/curb-gui.desktop" "$STAGE/usr/share/applications/curb-gui.desktop" 2>/dev/null || true
 fi

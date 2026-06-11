@@ -4,13 +4,21 @@ post_install() {
         groupadd --system curb
     fi
 
+    # setgid: binaries run as group curb — no logout required
+    chown root:curb /usr/bin/curb
+    chmod g+s       /usr/bin/curb
+    if [ -f /usr/bin/curb-gui ]; then
+        chown root:curb /usr/bin/curb-gui
+        chmod g+s       /usr/bin/curb-gui
+    fi
+
     systemctl daemon-reload
     systemctl enable --now curbd.service
 
     echo ""
-    echo "CURB installed. To allow a non-root user to control the daemon:"
-    echo "  sudo usermod -aG curb \$USER"
-    echo "Then log out and back in (or: newgrp curb)."
+    echo "CURB installed."
+    echo "  curb apps      — live per-application traffic"
+    echo "  curb-gui       — graphical interface"
 }
 
 post_upgrade() {

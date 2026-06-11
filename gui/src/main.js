@@ -845,8 +845,8 @@ function renderAppRow(tbody, app, level) {
                 <div class="app-cell">
                     <div class="app-icon" style="border-top: 2px solid ${appColor(app.exe)}">${app.name[0].toUpperCase()}</div>
                     <div class="app-info">
-                        <span class="app-name">${app.name}</span>
-                        <span class="app-path">${app.exe}</span>
+                        <span class="app-name">${escHtml(app.name)}</span>
+                        <span class="app-path">${escHtml(app.exe)}</span>
                     </div>
                     <button class="pin-btn ${pinnedApps.includes(app.exe) ? 'pin-btn-active' : ''}" title="${pinnedApps.includes(app.exe) ? 'Unpin from Dashboard' : 'Pin to Dashboard'}"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" stroke="none"><path d="M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z"/></svg></button>
                 </div>

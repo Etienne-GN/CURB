@@ -290,8 +290,12 @@ fn save(path: &PathBuf, data: &QuotaData) {
     let tmp = path.with_extension("json.tmp");
     match serde_json::to_vec_pretty(data) {
         Ok(bytes) => {
-            if std::fs::write(&tmp, bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
+            if let Ok(f) = std::fs::File::create(&tmp) {
+                use std::io::Write;
+                if std::io::BufWriter::new(&f).write_all(&bytes).is_ok() {
+                    let _ = f.sync_all();
+                    let _ = std::fs::rename(&tmp, path);
+                }
             }
         }
         Err(e) => debug!(error = %e, "serializing quota state"),

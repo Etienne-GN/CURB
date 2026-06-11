@@ -70,8 +70,8 @@ struct Counter {
 impl Counter {
     /// (down_bps, up_bps) since the last call; advances the cursor.
     fn rates(&mut self) -> (u64, u64) {
-        let d = self.down - self.last_down;
-        let u = self.up - self.last_up;
+        let d = self.down.saturating_sub(self.last_down);
+        let u = self.up.saturating_sub(self.last_up);
         self.last_down = self.down;
         self.last_up = self.up;
         (d, u)
@@ -281,7 +281,12 @@ fn capture_loop(socket: std::os::fd::OwnedFd, inner: Arc<Inner>) {
         let exe = match pm.lookup(s.proto, s.local_ip, s.local_port, s.rem_ip, s.rem_port) {
             Some(owner) => {
                 if flow_cache.len() >= FLOW_CACHE_MAX {
-                    flow_cache.clear();
+                    // Evict half the cache rather than clearing all to avoid
+                    // attribution loss spikes on busy hosts.
+                    let keep: Vec<_> = flow_cache.keys().cloned()
+                        .enumerate().filter(|(i, _)| i % 2 == 0)
+                        .map(|(_, k)| k).collect();
+                    flow_cache.retain(|k, _| keep.contains(k));
                 }
                 flow_cache
                     .entry(key)
@@ -330,8 +335,8 @@ impl Inner {
         let mut apps = Vec::with_capacity(acc.apps.len());
         let mut evict = Vec::new();
         for (exe, a) in acc.apps.iter_mut() {
-            let down_bps = a.down_total - a.last_down;
-            let up_bps = a.up_total - a.last_up;
+            let down_bps = a.down_total.saturating_sub(a.last_down);
+            let up_bps = a.up_total.saturating_sub(a.last_up);
             a.last_down = a.down_total;
             a.last_up = a.up_total;
             let lan_down_bps = a.lan_down - a.lan_last_down;

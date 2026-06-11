@@ -360,19 +360,28 @@ fn engine_unavailable() -> Response {
 fn set_socket_group(path: &std::path::Path) {
     use std::ffi::CString;
     let cname = CString::new("curb").unwrap();
-    // SAFETY: getgrnam is thread-safe when called before threads are spawned;
-    // we call it synchronously during startup, before the Tokio runtime accepts
-    // any connections.
+    // Use getgrnam_r (reentrant) so concurrent Tokio threads calling libc
+    // name-resolution functions can't race on the static internal buffer that
+    // the non-reentrant getgrnam uses.
     let gid = unsafe {
-        let grp = libc::getgrnam(cname.as_ptr());
-        if grp.is_null() {
+        let mut grp: libc::group = std::mem::zeroed();
+        let mut buf = vec![0i8; 1024];
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let rc = libc::getgrnam_r(
+            cname.as_ptr(),
+            &mut grp,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        );
+        if rc != 0 || result.is_null() {
             warn!(
                 "group `curb` not found — socket is root-only. \
                  Run the install script or: sudo groupadd curb && sudo usermod -aG curb $USER"
             );
             return;
         }
-        (*grp).gr_gid
+        grp.gr_gid
     };
     let c_path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
     // SAFETY: chown on a path we just created; errors are non-fatal.

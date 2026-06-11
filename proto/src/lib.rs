@@ -404,8 +404,11 @@ pub mod transport {
     {
         /// Wrap an async byte stream in the CURB framing.
         pub fn new(io: T) -> Self {
+            let codec = LengthDelimitedCodec::builder()
+                .max_frame_length(64 * 1024) // 64 KiB — plenty for any valid request
+                .new_codec();
             Self {
-                inner: Framed::new(io, LengthDelimitedCodec::new()),
+                inner: Framed::new(io, codec),
             }
         }
 

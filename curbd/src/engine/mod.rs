@@ -18,7 +18,7 @@ mod proc_connector;
 mod tc;
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -414,7 +414,12 @@ impl Engine {
 
         let mut out = Vec::new();
 
-        for (path, proto_str) in [("/proc/net/tcp", "TCP"), ("/proc/net/udp", "UDP")] {
+        for (path, proto_str, v6) in [
+            ("/proc/net/tcp",  "TCP", false),
+            ("/proc/net/udp",  "UDP", false),
+            ("/proc/net/tcp6", "TCP", true),
+            ("/proc/net/udp6", "UDP", true),
+        ] {
             let Ok(content) = std::fs::read_to_string(path) else {
                 continue;
             };
@@ -423,13 +428,20 @@ impl Engine {
                 if f.len() < 10 {
                     continue;
                 }
-                let (Some((lip, lport)), Some((rip, rport)), Ok(inode)) = (
-                    parse_v4_endpoint(f[1]),
-                    parse_v4_endpoint(f[2]),
-                    f[9].parse::<u64>(),
-                ) else {
-                    continue;
+                let (lip, lport, rip, rport) = if v6 {
+                    let (Some((la, lp)), Some((ra, rp))) = (
+                        parse_v6_endpoint(f[1]),
+                        parse_v6_endpoint(f[2]),
+                    ) else { continue };
+                    (IpAddr::V6(la), lp, IpAddr::V6(ra), rp)
+                } else {
+                    let (Some((la, lp)), Some((ra, rp))) = (
+                        parse_v4_endpoint(f[1]),
+                        parse_v4_endpoint(f[2]),
+                    ) else { continue };
+                    (IpAddr::V4(la), lp, IpAddr::V4(ra), rp)
                 };
+                let Ok(inode) = f[9].parse::<u64>() else { continue };
                 if rport == 0 {
                     continue; // listening / unconnected
                 }
@@ -781,6 +793,20 @@ fn parse_v4_endpoint(s: &str) -> Option<(Ipv4Addr, u16)> {
     Some((Ipv4Addr::from(word.to_le_bytes()), port))
 }
 
+fn parse_v6_endpoint(s: &str) -> Option<(Ipv6Addr, u16)> {
+    let (addr, port) = s.split_once(':')?;
+    if addr.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, chunk) in addr.as_bytes().chunks(8).enumerate() {
+        let word = u32::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+        bytes[i * 4..(i + 1) * 4].copy_from_slice(&word.to_le_bytes());
+    }
+    let port = u16::from_str_radix(port, 16).ok()?;
+    Some((Ipv6Addr::from(bytes), port))
+}
+
 /// Read `/proc/<pid>/exe`, stripping the kernel's " (deleted)" suffix.
 fn read_exe(pid: u32) -> String {
     let raw = std::fs::read_link(format!("/proc/{pid}/exe"))
@@ -815,11 +841,10 @@ fn basename(path: &str) -> String {
 /// Derive a stable, filesystem-safe cgroup directory name from an exe path:
 /// `<sanitized-basename>-<hash8>` so distinct paths never collide.
 fn sanitize_dir(exe: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    exe.hash(&mut h);
-    let hash = h.finish();
-
+    // FNV-1a (64-bit) — deterministic across restarts unlike DefaultHasher.
+    let hash = exe.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    });
     let base: String = basename(exe)
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })

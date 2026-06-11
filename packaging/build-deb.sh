@@ -35,12 +35,21 @@ mkdir -p "$STAGE/etc/systemd/system"
 install -m755 "$REPO_ROOT/target/release/curbd" "$STAGE/usr/local/bin/curbd"
 install -m755 "$REPO_ROOT/target/release/curb"  "$STAGE/usr/local/bin/curb"
 
-# GUI binary
+# GUI binary + desktop integration
 if [ -f "$GUI_BIN" ]; then
     install -m755 "$GUI_BIN" "$STAGE/usr/local/bin/curb-gui"
     mkdir -p "$STAGE/usr/share/applications"
-    install -m644 "$REPO_ROOT/packaging/curb-gui.desktop" "$STAGE/usr/share/applications/curb-gui.desktop" 2>/dev/null || true
+    install -m644 "$REPO_ROOT/packaging/curb-gui.desktop" "$STAGE/usr/share/applications/curb-gui.desktop"
 fi
+
+# Icons (needed for Icon=curb in the .desktop file to resolve)
+for SIZE in 32 128 256; do
+    SRC="$REPO_ROOT/gui/icons/${SIZE}x${SIZE}.png"
+    [ -f "$SRC" ] || continue
+    DEST="$STAGE/usr/share/icons/hicolor/${SIZE}x${SIZE}/apps"
+    mkdir -p "$DEST"
+    install -m644 "$SRC" "$DEST/curb.png"
+done
 
 # systemd unit
 install -m644 "$REPO_ROOT/packaging/curbd.service" "$STAGE/etc/systemd/system/curbd.service"

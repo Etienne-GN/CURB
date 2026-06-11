@@ -64,6 +64,15 @@ if [ -f "$GUI_BIN" ]; then
     install -Dm755 "$GUI_BIN" /usr/local/bin/curb-gui
     # GTK refuses setgid — the GUI relies on the user being in the curb group.
     info "Installed /usr/local/bin/curb-gui."
+
+    # Desktop entry + icons
+    install -Dm644 "$REPO_ROOT/packaging/curb-gui.desktop" /usr/share/applications/curb-gui.desktop
+    for SIZE in 32 128 256; do
+        SRC="$REPO_ROOT/gui/icons/${SIZE}x${SIZE}.png"
+        [ -f "$SRC" ] && install -Dm644 "$SRC" "/usr/share/icons/hicolor/${SIZE}x${SIZE}/apps/curb.png"
+    done
+    gtk-update-icon-cache -qtf /usr/share/icons/hicolor 2>/dev/null || true
+    update-desktop-database -q /usr/share/applications 2>/dev/null || true
 fi
 
 # ── 6. Install .desktop file (GUI launcher) ──────────────────────────────────

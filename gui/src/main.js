@@ -553,7 +553,15 @@ function renderDashboard() {
         setupDashboard();
     } else {
         tickDashboard();
-        tickPinnedBars();
+        // If pinned set changed (e.g. pinned from another tab), rebuild bars.
+        // Otherwise tick in-place to avoid flicker.
+        const zone = document.getElementById('dash-pinned-zone');
+        const barCount = zone ? zone.querySelectorAll('.pab').length : 0;
+        if (barCount !== pinnedApps.length) {
+            initPinnedBars();
+        } else {
+            tickPinnedBars();
+        }
     }
 }
 

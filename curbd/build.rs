@@ -26,6 +26,8 @@ fn main() {
             "-target",
             "bpf",
             "-I",
+            "/usr/include",
+            "-I",
             &arch_inc,
             "-c",
             src,

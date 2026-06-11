@@ -196,6 +196,11 @@ async function poll() {
         renderUI();
     } catch (err) {
         console.error("Poll error:", err);
+        const msg = (err && (err.message || err.toString())) || String(err);
+        const isConn = msg.includes('connect') || msg.includes('socket') || msg.includes('ENOENT');
+        document.getElementById('error-banner-msg').textContent =
+            isConn ? '⚠ Cannot reach curbd — is the daemon running?'
+                   : `⚠ UI error: ${msg}`;
         document.getElementById('error-banner').style.display = 'flex';
     }
 }
@@ -608,7 +613,7 @@ function initPinnedBars() {
 
         bar.querySelector('.pab-unpin').onclick = () => togglePin(app.exe);
 
-        const actions = bar.querySelector(`#pact-${exeId}`);
+        const actions = bar.querySelector('.pab-actions');
         const pDown = makeLimBtn('down', downLit);
         const pUp   = makeLimBtn('up',   upLit);
         pDown.onclick = (e) => {

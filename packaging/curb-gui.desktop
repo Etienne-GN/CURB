@@ -2,7 +2,7 @@
 Name=CURB
 GenericName=Bandwidth Monitor
 Comment=Per-application network bandwidth control
-Exec=curb-gui
+Exec=sg curb curb-gui
 Icon=curb
 Terminal=false
 Type=Application

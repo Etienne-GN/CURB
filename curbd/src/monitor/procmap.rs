@@ -84,6 +84,7 @@ impl ProcMap {
         ] {
             parse_net_file(path, proto, &inodes, &mut pm);
         }
+
         pm
     }
 }

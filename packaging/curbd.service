@@ -16,15 +16,17 @@ RestartSec=2
 Group=curb
 
 # Minimal capabilities — no full root privileges at the OS level.
-AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN CAP_NET_RAW
+# CAP_DAC_READ_SEARCH: required to open /proc/<pid>/fd/ for other-user processes
+#   (kernel 6.x: generic_permission on proc/fd denies unless dac_read_search is held).
+# CAP_SYS_PTRACE: required to read symlinks inside those fd dirs and to cross-reference
+#   socket inodes for per-app traffic attribution.
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_SYS_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 
 # Hardening
 NoNewPrivileges=yes
-# ProtectSystem=strict is intentionally omitted: it creates a mount namespace
-# that makes /proc/{pid}/fd unreadable for other processes, breaking per-app
-# traffic attribution.  The capability bounding set above is the primary
-# security boundary.
+# ProtectSystem=strict is intentionally omitted: it would hide /sys and /etc
+# paths needed for eBPF and tc operations.
 ProtectHome=read-only
 PrivateTmp=yes
 PrivateDevices=no

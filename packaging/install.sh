@@ -20,7 +20,7 @@ elif command -v pacman  &>/dev/null; then DISTRO=arch
 else DISTRO=unknown; fi
 
 # ── 1. Build release binaries if not already built ───────────────────────────
-if [ ! -f "$BUILD_DIR/curbd" ] || [ ! -f "$BUILD_DIR/curb" ]; then
+if [ ! -f "$BUILD_DIR/curbd" ] || [ ! -f "$BUILD_DIR/curb" ] || [ ! -f "$BUILD_DIR/curb-gui" ]; then
     info "Building release binaries (this may take a while)…"
     cd "$REPO_ROOT"
     cargo build --release -p curbd -p curb
@@ -45,8 +45,8 @@ if [ -n "$INSTALL_USER" ] && [ "$INSTALL_USER" != "root" ]; then
 else
     warn "Could not determine the installing user. Add yourself to the 'curb' group manually: sudo usermod -aG curb \$USER"
 fi
-# Note: curb-gui and curb binaries have the setgid bit set (group=curb), so they
-# work immediately from any terminal or desktop shortcut — no logout required.
+# Note: the curb CLI and curb-gui launcher are setgid (group=curb), so they work
+# immediately from any terminal or desktop shortcut — no logout required.
 
 # ── 4. Install binaries ───────────────────────────────────────────────────────
 install -Dm755 "$BUILD_DIR/curbd" /usr/local/bin/curbd
@@ -56,16 +56,20 @@ chown root:curb /usr/local/bin/curb
 chmod g+s       /usr/local/bin/curb
 info "Installed /usr/local/bin/curbd and /usr/local/bin/curb (setgid:curb)."
 
-# ── 5. Install GUI binary (if built) ─────────────────────────────────────────
+# ── 5. Install GUI + setgid launcher (if built) ─────────────────────────────
 GUI_BIN="$REPO_ROOT/gui/src-tauri/target/release/curb"
 # Fallback: older Tauri output name before we renamed the binary
 [ -f "$GUI_BIN" ] || GUI_BIN="$REPO_ROOT/gui/src-tauri/target/release/gui"
 if [ -f "$GUI_BIN" ]; then
-    install -Dm755 "$GUI_BIN" /usr/local/bin/curb-gui
-    # GTK refuses setgid — the GUI relies on the user being in the curb group.
-    info "Installed /usr/local/bin/curb-gui."
+    # GTK refuses to run setgid, so the real GUI lives in lib/ and the setgid
+    # launcher in bin/ switches to group curb before exec'ing it.
+    install -Dm755 "$GUI_BIN" /usr/local/lib/curb/curb-gui
+    install -Dm755 "$BUILD_DIR/curb-gui" /usr/local/bin/curb-gui
+    chown root:curb /usr/local/bin/curb-gui
+    chmod g+s       /usr/local/bin/curb-gui
+    info "Installed /usr/local/bin/curb-gui (setgid:curb launcher → /usr/local/lib/curb/curb-gui)."
 
-    # Desktop entry + icons
+    # ── 6. Desktop entry + icons ─────────────────────────────────────────────
     install -Dm644 "$REPO_ROOT/packaging/curb-gui.desktop" /usr/share/applications/curb-gui.desktop
     for SIZE in 32 128 256; do
         SRC="$REPO_ROOT/gui/icons/${SIZE}x${SIZE}.png"
@@ -73,13 +77,9 @@ if [ -f "$GUI_BIN" ]; then
     done
     gtk-update-icon-cache -qtf /usr/share/icons/hicolor 2>/dev/null || true
     update-desktop-database -q /usr/share/applications 2>/dev/null || true
-fi
-
-# ── 6. Install .desktop file (GUI launcher) ──────────────────────────────────
-DESKTOP_FILE="$REPO_ROOT/packaging/curb-gui.desktop"
-if [ -f "$DESKTOP_FILE" ] && [ -f /usr/local/bin/curb-gui ]; then
-    install -Dm644 "$DESKTOP_FILE" /usr/share/applications/curb-gui.desktop
-    info "Installed desktop launcher."
+    info "Installed desktop launcher (app menu: CURB)."
+else
+    warn "GUI not built — skipping curb-gui. Build it with: cd gui && cargo tauri build"
 fi
 
 # ── 7. Create persistent state directory ─────────────────────────────────────

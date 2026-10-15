@@ -32,7 +32,13 @@ package() {
 
     # Desktop file and GUI (if built)
     if [ -f gui/src-tauri/target/release/curb ]; then
-        install -Dm755 gui/src-tauri/target/release/curb "$pkgdir/usr/bin/curb-gui"
+        # GTK refuses setgid: real GUI in lib/, setgid launcher in bin/ (see curb.install)
+        install -Dm755 gui/src-tauri/target/release/curb "$pkgdir/usr/lib/curb/curb-gui"
+        install -Dm755 target/release/curb-gui "$pkgdir/usr/bin/curb-gui"
+        for size in 32 128 256; do
+            install -Dm644 gui/icons/${size}x${size}.png \
+                "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/curb.png"
+        done
         install -Dm644 packaging/curb-gui.desktop \
             "$pkgdir/usr/share/applications/curb-gui.desktop"
     fi

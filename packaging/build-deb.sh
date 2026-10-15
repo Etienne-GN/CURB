@@ -11,7 +11,7 @@ STAGE="/tmp/$PKG"
 echo "Building CURB $VERSION .deb…"
 
 # Build release binaries (skip if already built — CI builds first, then calls this)
-if [ ! -f "$REPO_ROOT/target/release/curbd" ] || [ ! -f "$REPO_ROOT/target/release/curb" ]; then
+if [ ! -f "$REPO_ROOT/target/release/curbd" ] || [ ! -f "$REPO_ROOT/target/release/curb" ] || [ ! -f "$REPO_ROOT/target/release/curb-gui" ]; then
     cargo build --release -p curbd -p curb
 fi
 
@@ -37,7 +37,9 @@ install -m755 "$REPO_ROOT/target/release/curb"  "$STAGE/usr/local/bin/curb"
 
 # GUI binary + desktop integration
 if [ -f "$GUI_BIN" ]; then
-    install -m755 "$GUI_BIN" "$STAGE/usr/local/bin/curb-gui"
+    # GTK refuses setgid: real GUI in lib/, setgid launcher in bin/ (see postinst)
+    install -Dm755 "$GUI_BIN" "$STAGE/usr/local/lib/curb/curb-gui"
+    install -m755 "$REPO_ROOT/target/release/curb-gui" "$STAGE/usr/local/bin/curb-gui"
     mkdir -p "$STAGE/usr/share/applications"
     install -m644 "$REPO_ROOT/packaging/curb-gui.desktop" "$STAGE/usr/share/applications/curb-gui.desktop"
 fi

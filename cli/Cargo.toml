@@ -11,6 +11,10 @@ repository.workspace = true
 name = "curb"
 path = "src/main.rs"
 
+[[bin]]
+name = "curb-gui"
+path = "src/bin/curb-gui.rs"
+
 [dependencies]
 curb-proto = { path = "../proto" }
 tokio.workspace = true

@@ -412,13 +412,21 @@ async fn resolve_exe(client: &mut Client, target: &str) -> Result<String> {
     }
     let snap = fetch_apps(client).await?;
     let want = target.to_ascii_lowercase();
-    let mut matches: Vec<String> = snap
-        .apps
+    let named: Vec<&AppStat> = snap.apps.iter().filter(|a| !a.exe.is_empty()).collect();
+    // An exact name match wins over substring matches, so `steam` doesn't
+    // collide with `steamwebhelper`.
+    let mut matches: Vec<String> = named
         .iter()
-        .filter(|a| !a.exe.is_empty())
-        .filter(|a| a.name.eq_ignore_ascii_case(&want) || a.name.to_ascii_lowercase().contains(&want))
+        .filter(|a| a.name.eq_ignore_ascii_case(&want))
         .map(|a| a.exe.clone())
         .collect();
+    if matches.is_empty() {
+        matches = named
+            .iter()
+            .filter(|a| a.name.to_ascii_lowercase().contains(&want))
+            .map(|a| a.exe.clone())
+            .collect();
+    }
     matches.sort();
     matches.dedup();
     match matches.len() {

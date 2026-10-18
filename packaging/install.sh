@@ -93,7 +93,9 @@ info "Installed /etc/systemd/system/curbd.service."
 
 # ── 9. Enable and start the daemon ───────────────────────────────────────────
 systemctl daemon-reload
-systemctl enable --now curbd
+systemctl enable curbd
+# restart (not just --now) so an upgrade replaces an already-running daemon
+systemctl restart curbd
 info "curbd is enabled and running."
 
 # ── 10. Verify ────────────────────────────────────────────────────────────────

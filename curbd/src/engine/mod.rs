@@ -20,6 +20,7 @@ mod tc;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,14 @@ const IFB_DEV: &str = "ifbcurb";
 const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// Polling interval when proc-connector is unavailable.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How often tracked apps' open connections are seeded into the eBPF flow map.
+/// A socket keeps the cgroup it was created in, so one opened in the moment
+/// between exec and cgroup placement is only classified once seeded.
+const SEED_INTERVAL: Duration = Duration::from_secs(1);
+/// Faster seeding right after a tracked process starts, to catch the
+/// connections it opens during startup before they carry much traffic.
+const SEED_FAST: Duration = Duration::from_millis(200);
+const SEED_FAST_WINDOW: Duration = Duration::from_secs(3);
 /// First HTB class minor assigned to per-app egress classes (1:10, 1:11, …).
 const FIRST_MINOR: u16 = 0x10;
 
@@ -161,40 +170,54 @@ impl Engine {
             std::thread::Builder::new()
                 .name("curb-reconcile".into())
                 .spawn(move || {
-                    match proc_connector::spawn() {
-                        Some(rx) => {
-                            info!("proc-connector active — new processes placed within milliseconds");
-                            let mut last_full = Instant::now();
-                            loop {
-                                // Block until an exec event arrives, waking at
-                                // most every FULL_SCAN_INTERVAL for a belt-and-
-                                // suspenders full scan.
-                                match rx.recv_timeout(FULL_SCAN_INTERVAL) {
-                                    Ok(pid) => {
-                                        reconcile_one(&inner, pid);
-                                        // Drain any burst of events without blocking.
-                                        while let Ok(p) = rx.try_recv() {
-                                            reconcile_one(&inner, p);
-                                        }
+                    if let Some(rx) = proc_connector::spawn() {
+                        info!("proc-connector active — new processes placed within milliseconds");
+                        let mut last_full = Instant::now();
+                        let mut last_seed = Instant::now();
+                        let mut fast_until: Option<Instant> = None;
+                        loop {
+                            // Wake on exec events, or every SEED_FAST at most.
+                            let placed = match rx.recv_timeout(SEED_FAST) {
+                                Ok(pid) => {
+                                    let mut placed = reconcile_one(&inner, pid);
+                                    // Drain any burst of events without blocking.
+                                    while let Ok(p) = rx.try_recv() {
+                                        placed |= reconcile_one(&inner, p);
                                     }
-                                    Err(_) => {} // timeout — fall through to full scan
+                                    placed
                                 }
-                                if last_full.elapsed() >= FULL_SCAN_INTERVAL {
-                                    reconcile_membership(&inner);
-                                    seed_existing_flows(&inner);
-                                    last_full = Instant::now();
+                                Err(RecvTimeoutError::Timeout) => false,
+                                Err(RecvTimeoutError::Disconnected) => {
+                                    warn!("proc-connector stopped; falling back to polling");
+                                    break;
                                 }
+                            };
+                            let now = Instant::now();
+                            if placed {
+                                fast_until = Some(now + SEED_FAST_WINDOW);
                             }
-                        }
-                        None => {
-                            warn!("proc-connector unavailable — using {}s polling for process tracking",
-                                  POLL_INTERVAL.as_secs());
-                            loop {
-                                std::thread::sleep(POLL_INTERVAL);
-                                reconcile_membership(&inner);
+                            let seed_every = match fast_until {
+                                Some(t) if now < t => SEED_FAST,
+                                _ => SEED_INTERVAL,
+                            };
+                            if placed || now.duration_since(last_seed) >= seed_every {
                                 seed_existing_flows(&inner);
+                                last_seed = now;
+                            }
+                            // Belt-and-suspenders full scan for anything missed.
+                            if now.duration_since(last_full) >= FULL_SCAN_INTERVAL {
+                                reconcile_membership(&inner);
+                                last_full = now;
                             }
                         }
+                    } else {
+                        warn!("proc-connector unavailable — using {}s polling for process tracking",
+                              POLL_INTERVAL.as_secs());
+                    }
+                    loop {
+                        std::thread::sleep(POLL_INTERVAL);
+                        reconcile_membership(&inner);
+                        seed_existing_flows(&inner);
                     }
                 })
                 .ok();
@@ -730,15 +753,20 @@ impl EngineInner {
 }
 
 /// Place a single PID into its app cgroup, if it belongs to a tracked app.
-/// Called immediately on every PROC_EVENT_EXEC from proc-connector.
-fn reconcile_one(inner: &EngineInner, pid: u32) {
+/// Called immediately on every PROC_EVENT_EXEC from proc-connector. Returns
+/// true when the PID was placed.
+fn reconcile_one(inner: &EngineInner, pid: u32) -> bool {
     let exe = read_exe(pid);
     if exe.is_empty() {
-        return;
+        return false;
     }
     let apps = inner.apps.lock().unwrap();
-    if let Some(r) = apps.get(&exe) {
-        cgroup::add_pid(&r.dir, pid);
+    match apps.get(&exe) {
+        Some(r) => {
+            cgroup::add_pid(&r.dir, pid);
+            true
+        }
+        None => false,
     }
 }
 

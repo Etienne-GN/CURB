@@ -15,6 +15,7 @@ mod cgroup;
 mod ebpf;
 mod nft;
 mod proc_connector;
+mod store;
 mod tc;
 
 use std::collections::HashMap;
@@ -226,6 +227,7 @@ impl Engine {
             st.host = host;
             st.enabled = true;
         }
+        self.persist();
         self.inner.reconcile_egress()?;
         self.inner.reconcile_ingress()?;
         self.inner.reconcile_nft()?;
@@ -236,6 +238,7 @@ impl Engine {
     /// (HTB/eBPF), ingress (IFB), and per-app (nft) layers.
     pub fn set_enabled(&self, enabled: bool) -> Result<LimiterState> {
         self.inner.state.lock().unwrap().enabled = enabled;
+        self.persist();
         self.inner.reconcile_egress()?;
         self.inner.reconcile_ingress()?;
         self.inner.reconcile_nft()?;
@@ -276,6 +279,7 @@ impl Engine {
         }
         // Configuring an app rule implies the limiter is on (mirrors host limits).
         self.inner.state.lock().unwrap().enabled = true;
+        self.persist();
         self.inner.reconcile_egress()?;
         self.inner.reconcile_ingress()?;
         self.inner.reconcile_nft()?;
@@ -377,6 +381,7 @@ impl Engine {
     /// Remove a per-application rule and release its cgroup.
     pub fn clear_app_limit(&self, exe: &str) -> Result<Vec<AppLimit>> {
         let removed = self.inner.apps.lock().unwrap().remove(exe);
+        self.persist();
         self.inner.reconcile_egress()?;
         self.inner.reconcile_ingress()?;
         self.inner.reconcile_nft()?;
@@ -386,11 +391,13 @@ impl Engine {
         Ok(self.list_app_limits())
     }
 
-    /// List configured per-application rules with live process counts.
+    /// List configured per-application rules with live process counts. Apps
+    /// tracked only for quota enforcement (no rate caps) are not rules.
     pub fn list_app_limits(&self) -> Vec<AppLimit> {
         let apps = self.inner.apps.lock().unwrap();
         let mut out: Vec<AppLimit> = apps
             .iter()
+            .filter(|(_, r)| r.down_bps.is_some() || r.up_bps.is_some())
             .map(|(exe, r)| AppLimit {
                 exe: exe.clone(),
                 name: r.name.clone(),
@@ -402,6 +409,74 @@ impl Engine {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Re-apply rules saved by a previous run (see [`store`]). Call once at
+    /// startup, before the quota manager re-applies its blocks.
+    pub fn restore(&self) -> Result<()> {
+        let saved = store::load();
+        if saved.apps.is_empty() && !saved.enabled {
+            return Ok(());
+        }
+        {
+            let mut st = self.inner.state.lock().unwrap();
+            st.enabled = saved.enabled;
+            st.host = saved.host;
+        }
+        {
+            let mut apps = self.inner.apps.lock().unwrap();
+            for a in saved.apps {
+                let dir = sanitize_dir(&a.exe);
+                if let Err(e) = cgroup::ensure_app(&dir) {
+                    warn!(exe = %a.exe, error = %e, "restoring app rule: creating cgroup failed");
+                    continue;
+                }
+                let minor = self.inner.alloc_minor();
+                apps.insert(
+                    a.exe.clone(),
+                    AppRuleState {
+                        name: basename(&a.exe),
+                        dir,
+                        down_bps: a.down_bps,
+                        up_bps: a.up_bps,
+                        scope: a.scope,
+                        blocked: false,
+                        minor,
+                    },
+                );
+            }
+        }
+        self.inner.reconcile_egress()?;
+        self.inner.reconcile_ingress()?;
+        self.inner.reconcile_nft()?;
+        reconcile_membership(&self.inner);
+        seed_existing_flows(&self.inner);
+        info!(apps = self.inner.apps.lock().unwrap().len(), "restored saved rules");
+        Ok(())
+    }
+
+    /// Save the master switch, host caps, and rate-limited app rules. Rules that
+    /// exist only for quota enforcement are left to the quota manager.
+    fn persist(&self) {
+        let (enabled, host) = {
+            let st = self.inner.state.lock().unwrap();
+            (st.enabled, st.host)
+        };
+        let apps = self
+            .inner
+            .apps
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.down_bps.is_some() || r.up_bps.is_some())
+            .map(|(exe, r)| store::SavedApp {
+                exe: exe.clone(),
+                down_bps: r.down_bps,
+                up_bps: r.up_bps,
+                scope: r.scope,
+            })
+            .collect();
+        store::save(&store::SavedRules { enabled, host, apps });
     }
 
     /// Enumerate active TCP/UDP connections and attribute each to its owning app.

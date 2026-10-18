@@ -111,18 +111,27 @@ impl QuotaManager {
         budget_bytes: u64,
         period: QuotaPeriod,
         direction: Direction,
-    ) -> Vec<QuotaStatus> {
+    ) -> anyhow::Result<Vec<QuotaStatus>> {
         // Track the app now so the cgroup exists and its processes are placed,
-        // making enforcement effective the moment the budget is exceeded.
-        if let Err(e) = self.inner.engine.ensure_tracked(&exe) {
-            warn!(exe, error = %e, "could not start tracking app for quota");
-        }
+        // making enforcement effective the moment the budget is exceeded. A
+        // quota that can't be enforced must not be reported as set.
+        self.inner
+            .engine
+            .ensure_tracked(&exe)
+            .map_err(|e| e.context("quota cannot be enforced"))?;
         let (down, up) = self.inner.totals_for(&exe);
+        let mut unblock = false;
         {
             let mut data = self.inner.data.lock().unwrap();
-            data.quotas.insert(
-                exe.clone(),
-                QuotaEntry {
+            let entry = match data.quotas.get(&exe) {
+                // Editing an existing quota with the same period and direction
+                // keeps its usage so far; otherwise counting starts fresh.
+                Some(old) if old.period == period && old.direction == direction => QuotaEntry {
+                    budget_bytes,
+                    exceeded: old.exceeded && old.used_bytes >= budget_bytes,
+                    ..old.clone()
+                },
+                old => QuotaEntry {
                     name: basename(&exe),
                     budget_bytes,
                     period,
@@ -130,14 +139,23 @@ impl QuotaManager {
                     used_bytes: 0,
                     period_start_ms: now_ms(),
                     exceeded: false,
-                    last_down_total: down,
-                    last_up_total: up,
+                    last_down_total: old.map_or(down, |o| o.last_down_total),
+                    last_up_total: old.map_or(up, |o| o.last_up_total),
                 },
-            );
+            };
+            if let Some(old) = data.quotas.get(&exe) {
+                unblock = old.exceeded && !entry.exceeded;
+            }
+            data.quotas.insert(exe.clone(), entry);
             save(&self.inner.path, &data);
         }
+        if unblock {
+            if let Err(e) = self.inner.engine.set_app_blocked(&exe, false) {
+                warn!(exe, error = %e, "unblocking app after quota edit failed");
+            }
+        }
         self.inner.tick(); // evaluate immediately
-        self.list()
+        Ok(self.list())
     }
 
     /// Remove a quota and unblock the app if it was blocked.
@@ -210,12 +228,14 @@ impl Inner {
         let mut actions: Vec<(String, bool)> = Vec::new();
         {
             let mut data = self.data.lock().unwrap();
+            let mut dirty = false;
             for (exe, q) in data.quotas.iter_mut() {
                 // Period reset.
                 if let Some(len) = period_len(q.period) {
                     if now >= q.period_start_ms + len.as_millis() as u64 {
                         q.period_start_ms = now;
                         q.used_bytes = 0;
+                        dirty = true;
                         if q.exceeded {
                             q.exceeded = false;
                             actions.push((exe.clone(), false));
@@ -230,20 +250,24 @@ impl Inner {
                 if let Some(&(d, u)) = totals.get(exe.as_str()) {
                     let dd = d.saturating_sub(q.last_down_total);
                     let du = u.saturating_sub(q.last_up_total);
-                    q.last_down_total = d;
-                    q.last_up_total = u;
-                    q.used_bytes += match q.direction {
+                    let delta = match q.direction {
                         Direction::Down => dd,
                         Direction::Up => du,
                         Direction::Both => dd + du,
                     };
+                    dirty |= delta > 0 || q.last_down_total != d || q.last_up_total != u;
+                    q.last_down_total = d;
+                    q.last_up_total = u;
+                    q.used_bytes += delta;
                 }
                 if q.used_bytes >= q.budget_bytes && !q.exceeded {
                     q.exceeded = true;
                     actions.push((exe.clone(), true));
                 }
             }
-            save(&self.path, &data);
+            if dirty || !actions.is_empty() {
+                save(&self.path, &data);
+            }
         }
 
         for (exe, block) in actions {

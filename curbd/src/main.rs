@@ -40,6 +40,10 @@ struct Args {
     socket: Option<PathBuf>,
 }
 
+/// Shaping-engine init retries at startup (covers DHCP lag at boot: 30 × 1 s).
+const ENGINE_INIT_ATTEMPTS: u32 = 30;
+const ENGINE_INIT_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Process-wide daemon state shared across connections.
 struct State {
     started: Instant,
@@ -118,14 +122,29 @@ async fn main() -> Result<()> {
     let daemon_cfg = config::load();
 
     // Initialize the shaping engine (detects the default interface; applies no
-    // kernel changes until a limit is set).
-    let engine = match Engine::new_on(daemon_cfg.interface.as_deref()) {
-        Ok(e) => Some(e),
-        Err(e) => {
-            warn!(error = %e, "shaping engine unavailable (no default route?)");
-            None
+    // kernel changes until a limit is set). At boot the default route may not
+    // exist yet (DHCP still running), so retry for a while before giving up.
+    let mut engine = None;
+    for attempt in 1..=ENGINE_INIT_ATTEMPTS {
+        match Engine::new_on(daemon_cfg.interface.as_deref()) {
+            Ok(e) => {
+                engine = Some(e);
+                break;
+            }
+            Err(e) if attempt < ENGINE_INIT_ATTEMPTS => {
+                debug!(error = %e, attempt, "shaping engine not ready; retrying");
+                tokio::time::sleep(ENGINE_INIT_RETRY).await;
+            }
+            Err(e) => warn!(error = %e, "shaping engine unavailable (no default route?)"),
         }
-    };
+    }
+
+    // Re-apply rules saved by the previous run (before quotas add their blocks).
+    if let Some(e) = &engine {
+        if let Err(err) = e.restore() {
+            warn!(error = %format!("{err:#}"), "restoring saved rules failed");
+        }
+    }
 
     // The quota manager needs both live accounting (monitor) and enforcement
     // (engine); start it only when both are available.
@@ -323,7 +342,12 @@ fn dispatch(req: Request, state: &State) -> Response {
             period,
             direction,
         } => match &state.quota {
-            Some(q) => Response::Quotas(q.set_quota(exe, budget_bytes, period, direction)),
+            Some(q) => match q.set_quota(exe, budget_bytes, period, direction) {
+                Ok(quotas) => Response::Quotas(quotas),
+                Err(err) => Response::Error {
+                    message: format!("{err:#}"),
+                },
+            },
             None => quota_unavailable(),
         },
         Request::ClearQuota { exe } => match &state.quota {

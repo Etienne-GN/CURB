@@ -1,10 +1,16 @@
 [Unit]
 Description=CURB — per-application bandwidth-control daemon
 Documentation=https://github.com/Etienne-GN/CURB
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
+# /sys/fs/cgroup is mode 0555, so creating directories there needs
+# CAP_DAC_OVERRIDE, which the bounding set below deliberately omits. Create the
+# CURB base cgroup with full privileges ("+") first; curbd (uid 0, owner) can
+# then create per-app leaves inside it without the extra capability.
+ExecStartPre=+/usr/bin/mkdir -p /sys/fs/cgroup/curb
 ExecStart=/usr/local/bin/curbd
 Restart=on-failure
 RestartSec=2

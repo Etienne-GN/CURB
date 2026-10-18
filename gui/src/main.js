@@ -51,11 +51,13 @@ function togglePin(exe) {
     if (currentView === 'Dashboard') initPinnedBars();
 }
 
+// Binary units (1 MB = 1024 KB), matching parseRate() and the CLI, so a
+// displayed value can be edited and re-applied unchanged.
 function formatRate(bps) {
     if (bps === null || bps === undefined) return "—";
-    if (bps >= 1e9) return (bps / 1e9).toFixed(2) + " GB/s";
-    if (bps >= 1e6) return (bps / 1e6).toFixed(2) + " MB/s";
-    if (bps >= 1e3) return (bps / 1e3).toFixed(1) + " KB/s";
+    if (bps >= 1024 ** 3) return (bps / 1024 ** 3).toFixed(2) + " GB/s";
+    if (bps >= 1024 ** 2) return (bps / 1024 ** 2).toFixed(2) + " MB/s";
+    if (bps >= 1024) return (bps / 1024).toFixed(1) + " KB/s";
     return bps.toFixed(0) + " B/s";
 }
 
@@ -71,24 +73,26 @@ function formatUsage(down, up) {
     return total > 0 ? formatSize(total) : '—';
 }
 
+// Parse a rate into integer bytes/sec. Accepts formatRate() output ("5.00 MB/s")
+// and bit rates ("10mbit", "10 Mbps"). Returns null for empty/"unlimited" and
+// undefined when the input can't be understood, so typos never silently clear a
+// limit.
+const RATE_UNITS = {
+    gbit: 1e9 / 8, mbit: 1e6 / 8, kbit: 1e3 / 8, bit: 1 / 8,
+    gbps: 1e9 / 8, mbps: 1e6 / 8, kbps: 1e3 / 8, bps: 1 / 8,
+    gib: 1024 ** 3, mib: 1024 ** 2, kib: 1024,
+    gb: 1024 ** 3, mb: 1024 ** 2, kb: 1024, b: 1,
+};
 function parseRate(input) {
-    if (!input || input === "—" || input === "unlimited" || input === "0") return null;
-    const match = input.toLowerCase().match(/^([\d\.]+)\s*(gbit|mbit|kbit|bit|gb|mb|kb|b)?$/);
-    if (!match) return null;
-    const val = parseFloat(match[1]);
-    const unit = match[2] || "b/s";
-
-    switch (unit) {
-        case "gbit": return (val * 1000000000) / 8;
-        case "mbit": return (val * 1000000) / 8;
-        case "kbit": return (val * 1000) / 8;
-        case "bit": return val / 8;
-        case "gb": return val * 1024 * 1024 * 1024;
-        case "mb": return val * 1024 * 1024;
-        case "kb": return val * 1024;
-        case "b": return val;
-        default: return val; // bytes/sec
-    }
+    if (input === null || input === undefined) return null;
+    const t = String(input).trim().toLowerCase().replace(/\s+/g, '').replace(/\/s$/, '');
+    if (!t || t === '—' || t === 'unlimited' || t === '0') return null;
+    const m = t.match(/^(\d+(?:\.\d+)?|\.\d+)([a-z]*)$/);
+    if (!m) return undefined;
+    const factor = m[2] ? RATE_UNITS[m[2]] : 1;
+    if (factor === undefined) return undefined;
+    const bytes = Math.round(parseFloat(m[1]) * factor);
+    return bytes > 0 ? bytes : undefined;
 }
 
 function parseSize(input) {
@@ -212,65 +216,6 @@ async function poll() {
 
 // --- UI Components ---
 
-function createSpinner(value, onUpdate) {
-    const container = document.createElement('div');
-    container.className = 'spinner-control';
-    
-    const valDisplay = document.createElement('div');
-    valDisplay.className = 'spinner-value';
-    valDisplay.textContent = formatRate(value);
-    
-    const btns = document.createElement('div');
-    btns.className = 'spinner-btns';
-    
-    const upBtn = document.createElement('div');
-    upBtn.className = 'spinner-btn';
-    upBtn.textContent = '▲';
-    upBtn.onclick = (e) => {
-        e.stopPropagation();
-        const currentIdx = PRESETS.findIndex(p => p !== null && p >= value);
-        const next = currentIdx === -1 ? PRESETS[1] : PRESETS[Math.min(currentIdx + (value === PRESETS[currentIdx] ? 1 : 0), PRESETS.length - 1)];
-        onUpdate(next);
-    };
-    
-    const downBtn = document.createElement('div');
-    downBtn.className = 'spinner-btn';
-    downBtn.textContent = '▼';
-    downBtn.onclick = (e) => {
-        e.stopPropagation();
-        const currentIdx = PRESETS.findIndex(p => p !== null && p >= value);
-        const next = currentIdx <= 1 ? null : PRESETS[currentIdx - 1];
-        onUpdate(next);
-    };
-
-    valDisplay.onclick = (e) => {
-        e.stopPropagation();
-        const input = document.createElement('input');
-        input.className = 'spinner-input';
-        input.value = value ? formatRate(value).replace(/\s/g, '').toLowerCase() : "";
-        input.onkeydown = (ev) => {
-            if (ev.key === 'Enter') {
-                onUpdate(parseRate(input.value));
-                container.removeChild(input);
-            } else if (ev.key === 'Escape') {
-                container.removeChild(input);
-            }
-        };
-        input.onblur = () => {
-            if (container.contains(input)) container.removeChild(input);
-        };
-        container.appendChild(input);
-        input.focus();
-    };
-
-    btns.appendChild(upBtn);
-    btns.appendChild(downBtn);
-    container.appendChild(valDisplay);
-    container.appendChild(btns);
-    
-    return container;
-}
-
 // --- UI Rendering ---
 
 function renderUI() {
@@ -290,7 +235,8 @@ function renderUI() {
         else if (v === 'Rules')        renderRules();
         else if (v === 'Quotas')       renderQuotas();
         else if (v === 'Connections')  renderConnections();
-        else if (v === 'Settings')     loadSettingsData();
+        // Settings is rendered once on entry (see the nav handler); re-rendering
+        // it every poll would wipe whatever the user is typing.
     }
     renderDetailStrip();
 }
@@ -813,7 +759,7 @@ function renderAppRow(tbody, app, level) {
     let statusLabel = "Watching";
     let statusClass = "pill-muted";
     if (quota && quota.exceeded) {
-        statusLabel = "Throttled";
+        statusLabel = "Blocked";
         statusClass = "pill-rose";
     } else if (limit) {
         statusLabel = "Limited";
@@ -929,7 +875,7 @@ function renderDetailStrip() {
 
     let status = "Watching";
     let statusClass = "pill-muted";
-    if (quota && quota.exceeded) { status = "Throttled"; statusClass = "pill-rose"; }
+    if (quota && quota.exceeded) { status = "Blocked"; statusClass = "pill-rose"; }
     else if (limit)               { status = "Limited";   statusClass = "pill-emerald"; }
 
     pillsContainer.innerHTML = `<div class="pill ${statusClass}">${status}</div>`;
@@ -1035,8 +981,8 @@ function renderRules() {
 function showRuleModal(existing) {
     const isNew = !existing;
     const fields = [
-        ...(isNew ? [{ id: 'exe', label: 'Executable path', placeholder: '/usr/bin/firefox', value: '' }] : []),
-        { id: 'down', label: '↓ Download limit (e.g. 5 MB/s, or blank for unlimited)', placeholder: 'unlimited', value: existing ? formatRate(existing.down_bps) : '' },
+        ...(isNew ? [{ id: 'exe', label: 'Application (type a name or path)', placeholder: '/usr/bin/firefox', value: '', suggestions: knownExes() }] : []),
+        { id: 'down', label: '↓ Download limit (e.g. 5 MB/s, 20 mbit, or blank for unlimited)', placeholder: 'unlimited', value: existing ? formatRate(existing.down_bps) : '' },
         { id: 'up',   label: '↑ Upload limit',   placeholder: 'unlimited', value: existing ? formatRate(existing.up_bps)   : '' },
         {
             id: 'scope', label: 'Scope', type: 'select', value: existing ? existing.scope.toLowerCase() : 'both',
@@ -1044,11 +990,19 @@ function showRuleModal(existing) {
         },
     ];
     showModal(isNew ? 'Add Rule' : `Edit Rule — ${existing.name}`, fields, async (vals) => {
-        const exe   = isNew ? vals.exe.trim() : existing.exe;
-        const downBps = vals.down.trim() ? parseRate(vals.down) : null;
-        const upBps   = vals.up.trim()   ? parseRate(vals.up)   : null;
+        const exe   = isNew ? resolveExe(vals.exe) : existing.exe;
+        const downBps = parseRate(vals.down);
+        const upBps   = parseRate(vals.up);
         const scope   = vals.scope;
         if (!exe) return;
+        if (downBps === undefined || upBps === undefined) {
+            alert('Invalid rate. Use e.g. "5 MB/s", "500 KB/s" or "20 mbit", or leave blank for unlimited.');
+            return;
+        }
+        if (downBps === null && upBps === null) {
+            alert('Set at least one of the download or upload limits.');
+            return;
+        }
         try {
             await invoke('set_app_limit', { exe, downBps, upBps, scope });
             poll();
@@ -1177,10 +1131,10 @@ function renderQuotas() {
     view.appendChild(wrap);
 }
 
-function showQuotaModal(existing) {
+function showQuotaModal(existing, exeHint = '') {
     const isNew = !existing;
     const fields = [
-        ...(isNew ? [{ id: 'exe', label: 'Executable path', placeholder: '/usr/bin/firefox', value: '' }] : []),
+        ...(isNew ? [{ id: 'exe', label: 'Application (type a name or path)', placeholder: '/usr/bin/firefox', value: exeHint, suggestions: knownExes() }] : []),
         { id: 'budget', label: 'Budget (e.g. 10 GB, 500 MB)', placeholder: '10 GB', value: existing ? formatSize(existing.budget_bytes) : '' },
         {
             id: 'period', label: 'Reset period', type: 'select',
@@ -1202,9 +1156,9 @@ function showQuotaModal(existing) {
         },
     ];
     showModal(isNew ? 'Add Quota' : `Edit Quota — ${existing.name}`, fields, async (vals) => {
-        const exe = isNew ? vals.exe.trim() : existing.exe;
+        const exe = isNew ? resolveExe(vals.exe) : existing.exe;
         const budgetBytes = parseSize(vals.budget);
-        if (!exe) { alert('Executable path is required.'); return; }
+        if (!exe) return;
         if (!budgetBytes) { alert('Invalid budget. Use e.g. "10 GB" or "500 MB".'); return; }
         try {
             await invoke('set_quota', { exe, budgetBytes, period: vals.period, direction: vals.direction });
@@ -1343,6 +1297,17 @@ function showModal(title, fields, onOk) {
             inp.type = 'text';
             inp.value = f.value || '';
             inp.placeholder = f.placeholder || '';
+            if (f.suggestions && f.suggestions.length) {
+                const dl = document.createElement('datalist');
+                dl.id = 'mf-' + f.id + '-list';
+                for (const v of f.suggestions) {
+                    const o = document.createElement('option');
+                    o.value = v;
+                    dl.appendChild(o);
+                }
+                row.appendChild(dl);
+                inp.setAttribute('list', dl.id);
+            }
             inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyModal(); });
             row.appendChild(inp);
         }
@@ -1428,52 +1393,35 @@ async function setAppLimit(exe, dir, val) {
     } catch (err) { alert(err); }
 }
 
-async function cycleScope(exe) {
-    const limit = appLimits.find(l => l.exe === exe);
-    if (!limit) return;
-
-    const scopes = ['both', 'lan', 'internet'];
-    let idx = scopes.indexOf(limit.scope.toLowerCase());
-    const newScope = scopes[(idx + 1) % 3];
-
-    try {
-        await invoke('set_app_limit', { 
-            exe, 
-            downBps: limit.down_bps, 
-            upBps: limit.up_bps, 
-            scope: newScope 
-        });
-        poll();
-    } catch (err) { alert(err); }
+function promptQuota(exe) {
+    // Open the full quota editor so the existing period and direction are kept.
+    showQuotaModal(quotas.find(q => q.exe === exe) || null, exe);
 }
 
-async function promptQuota(exe) {
-    const quota = quotas.find(q => q.exe === exe);
-    const input = prompt(`Daily budget for ${exe} (e.g. 10GB, 500MB, or empty to clear):`, 
-        quota ? formatSize(quota.budget_bytes) : "");
-    
-    if (input === null) return;
-
-    if (input.trim() === "") {
-        try {
-            await invoke('clear_quota', { exe });
-            poll();
-        } catch (err) { alert(err); }
-        return;
+/**
+ * Resolve a typed application to an executable path: a path is used as-is, a
+ * name must match exactly one known app (exact name first, then substring).
+ * Returns null after telling the user why it couldn't be resolved.
+ */
+function resolveExe(input) {
+    const t = input.trim();
+    if (!t || t.includes('/')) return t || null;
+    const want = t.toLowerCase();
+    const named = apps.filter(a => a.exe);
+    let hits = [...new Set(named.filter(a => a.name.toLowerCase() === want).map(a => a.exe))];
+    if (hits.length === 0) {
+        hits = [...new Set(named.filter(a => a.name.toLowerCase().includes(want)).map(a => a.exe))];
     }
+    if (hits.length === 1) return hits[0];
+    alert(hits.length === 0
+        ? `No running application named "${t}". Pick one from the list or enter its full path.`
+        : `"${t}" matches several executables:\n${hits.join('\n')}\nEnter the full path.`);
+    return null;
+}
 
-    const budgetBytes = parseSize(input);
-    if (!budgetBytes) { alert("Invalid size"); return; }
-
-    try {
-        await invoke('set_quota', { 
-            exe, 
-            budgetBytes, 
-            period: 'daily', 
-            direction: 'both' 
-        });
-        poll();
-    } catch (err) { alert(err); }
+/** Executable paths the daemon has seen, for the Add Rule/Quota pickers. */
+function knownExes() {
+    return [...new Set(apps.map(a => a.exe).filter(Boolean))].sort();
 }
 
 // --- Limit Popup ---
@@ -1534,7 +1482,13 @@ function initLimitPopup() {
         const fn      = popupApplyFn;
         const enabled = chk.checked;
         const raw     = inp.value.trim();
-        const bps     = (enabled && raw) ? parseRate(raw) : null;
+        const bps     = enabled ? parseRate(raw) : null;
+        if (bps === undefined) {
+            inp.classList.add('lp-invalid');
+            inp.title = 'Use e.g. 5 MB/s, 500 KB/s or 20 mbit';
+            inp.focus();
+            return;
+        }
         hideLimitPopup();
         try { await fn(bps); } catch (err) { alert(err); }
         poll();
@@ -1545,7 +1499,11 @@ function initLimitPopup() {
         if (e.key === 'Enter')  { e.preventDefault(); apply(); }
         if (e.key === 'Escape') { hideLimitPopup(); poll(); }
     };
-    inp.oninput = () => { if (inp.value) lastLimitVal[currentPopupKey()] = inp.value; };
+    inp.oninput = () => {
+        inp.classList.remove('lp-invalid');
+        inp.title = '';
+        if (inp.value) lastLimitVal[currentPopupKey()] = inp.value;
+    };
 
     document.addEventListener('mousedown', (e) => {
         if (popupOpen && !document.getElementById('limit-popup').contains(e.target)) {
@@ -1585,7 +1543,8 @@ document.querySelectorAll('.nav-item[data-view]').forEach((item) => {
         currentView = VIEW_LABEL[item.dataset.view] || item.dataset.view;
         document.querySelectorAll('.nav-item').forEach((n) => n.classList.remove('active'));
         item.classList.add('active');
-        renderTable();
+        renderUI();
+        if (currentView === 'Settings') loadSettingsData();
     };
 });
 
